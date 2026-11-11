@@ -1,0 +1,17 @@
+[package]
+name = "letsharness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+
+description = "A fully hackable agent harness."
+authors = ["potistudio <potistudio@proton.me>"]
+license = "MIT"
+publish = false
+repository = "https://github.com/potistudio/LetsHarness"
+readme = "README.md"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

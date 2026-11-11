@@ -1,5 +1,8 @@
 # macOS dummy files
 .DS_Store
 
+# Cargo artifacts
+target/
+
 # Personal references
 refs/
