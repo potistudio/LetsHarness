@@ -769,6 +769,8 @@ mod tests {
 		assert!((m.remaining - 65.39).abs() < 1e-9);
 		assert!((m.used - (70.0 - 65.39)).abs() < 1e-9);
 		assert_eq!(m.reset_at_ms, Some(1_796_916_319_000));
+		assert!((m.used_pct - (70.0 - 65.39) / 70.0 * 100.0).abs() < 1e-9);
+		assert!((five.used_pct - 0.22 / 14.0 * 100.0).abs() < 1e-9);
 	}
 
 	#[test]

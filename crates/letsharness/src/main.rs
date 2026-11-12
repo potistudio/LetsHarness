@@ -261,22 +261,13 @@ async fn run_quota(client: &dyn Provider, json: bool) -> anyhow::Result<()> {
 		}
 	}
 	if let Some(w) = &quota.five_hour {
-		println!(
-			"5h: used={:.4} / cap={:.4} (remaining={:.4}) reset_ms={:?} exceeded={}",
-			w.used, w.cap, w.remaining, w.reset_at_ms, w.exceeded
-		);
+		print_window("5h", w);
 	}
 	if let Some(w) = &quota.weekly {
-		println!(
-			"weekly: used={:.4} / cap={:.4} (remaining={:.4}) reset_ms={:?} exceeded={}",
-			w.used, w.cap, w.remaining, w.reset_at_ms, w.exceeded
-		);
+		print_window("weekly", w);
 	}
 	if let Some(w) = &quota.monthly {
-		println!(
-			"monthly: used={:.4} / cap={:.4} (remaining={:.4}) reset_ms={:?} exceeded={}",
-			w.used, w.cap, w.remaining, w.reset_at_ms, w.exceeded
-		);
+		print_window("monthly", w);
 	}
 	if let Some(spend) = quota.period_spend {
 		let tokens = quota.period_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".into());
@@ -286,6 +277,19 @@ async fn run_quota(client: &dyn Provider, json: bool) -> anyhow::Result<()> {
 		eprintln!("(empty quota: --json で生値を確認)");
 	}
 	Ok(())
+}
+
+fn print_window(label: &str, w: &llm::QuotaWindow) {
+	println!(
+		"{label}: used={:.4} ({:.1}%) / cap={:.4} (remaining={:.4}, {:.1}%) reset_ms={:?} exceeded={}",
+		w.used,
+		w.used_pct,
+		w.cap,
+		w.remaining,
+		w.remaining_pct(),
+		w.reset_at_ms,
+		w.exceeded
+	);
 }
 
 #[cfg(test)]

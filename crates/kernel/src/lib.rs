@@ -158,19 +158,33 @@ pub struct QuotaWindow {
 	pub used: f64,
 	pub cap: f64,
 	pub remaining: f64,
+	/// 消費率 (0..=100)。`cap <= 0` のときは 0。
+	#[serde(default)]
+	pub used_pct: f64,
 	pub reset_at_ms: Option<i64>,
 	pub exceeded: bool,
 }
 
 impl QuotaWindow {
 	pub fn new(used: f64, cap: f64, reset_at_ms: Option<i64>, exceeded: bool) -> Self {
+		let used_pct = if cap > 0.0 {
+			(used / cap * 100.0).clamp(0.0, 100.0)
+		} else {
+			0.0
+		};
 		Self {
 			used,
 			cap,
 			remaining: (cap - used).max(0.0),
+			used_pct,
 			reset_at_ms,
 			exceeded,
 		}
+	}
+
+	/// 残量率 (0..=100)。
+	pub fn remaining_pct(&self) -> f64 {
+		100.0 - self.used_pct
 	}
 }
 
