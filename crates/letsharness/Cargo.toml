@@ -1,0 +1,20 @@
+[package]
+name = "letsharness"
+description = "A fully hackable agent harness."
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+letsharness-kernel.workspace = true
+letsharness-provider-commandcode.workspace = true
+letsharness-provider-mock.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true

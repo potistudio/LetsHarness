@@ -7,121 +7,92 @@
 //! - それ以外              -> POST /chat/completions (OpenAI Chat Completions)
 //! - `supported_endpoints` に `/responses` を含む -> POST /responses も可
 //!
-//! [`CommandCodeClient`] は [`crate::llm::LlmClient`] を実装するため、
-//! `Arc<dyn LlmClient>` として差し替え可能。
+//! [`CommandCodeProvider`] は [`Provider`] を実装するため、
+//! `Arc<dyn Provider>` として差し替え可能。
 
 use futures_util::StreamExt;
 
-use crate::llm::LlmClient;
-// 後方互換: 既存の `commandcode::{ChatMessage, Error, ModelInfo, Result}` importを壊さない
-pub use crate::llm::{ChatMessage, Error, ModelInfo, Result};
+use letsharness_kernel::{ChatMessage, Error, ModelInfo, Provider, Result};
+
+const PLUGIN: &str = "commandcode";
+
+/// reqwest のエラーを kernel の [`Error::Plugin`] に包む (kernel は reqwest を知らない)。
+fn transport(e: reqwest::Error) -> Error {
+	Error::plugin(PLUGIN, e)
+}
 
 pub const DEFAULT_BASE_URL: &str = "https://api.commandcode.ai/provider/v1";
 const MODELS_TIMEOUT_SECS: u64 = 30;
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 
-// ---------------------------------------------------------------------------
-// Auth resolution (pi-commandcode-provider と同じ優先順位)
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Auth
+// -----------------------------------------------------------------------------
 
-fn api_key_from_json(value: &serde_json::Value) -> Option<String> {
-	// {"apiKey": "user_..."}
-	if let Some(s) = value.get("apiKey").and_then(|v| v.as_str())
-		&& !s.is_empty()
-	{
-		return Some(s.to_string());
-	}
-	for key in ["commandcode", "command-code"] {
-		let entry = value.get(key)?;
-		// "commandcode": "user_..."
-		if let Some(s) = entry.as_str()
-			&& !s.is_empty()
-		{
-			return Some(s.to_string());
-		}
-		// {"type":"api","key":"..."} / {"type":"oauth","access":"..."}
-		if let Some(s) = entry.get("key").and_then(|v| v.as_str())
-			&& !s.is_empty()
-		{
-			return Some(s.to_string());
-		}
-		if let Some(s) = entry.get("access").and_then(|v| v.as_str())
-			&& !s.is_empty()
-		{
-			return Some(s.to_string());
-		}
-	}
-	None
-}
-
-fn read_key_file(path: &std::path::Path) -> Option<String> {
-	let text = std::fs::read_to_string(path).ok()?;
-	let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-	api_key_from_json(&v)
-}
-
-/// 環境変数 → 認証ファイルの順でキーを探す。
+/// Finds the API key from the environment variable.
 pub fn load_api_key() -> Option<String> {
-	for env_key in ["COMMAND_CODE_API_KEY", "COMMANDCODE_API_KEY"] {
-		if let Ok(v) = std::env::var(env_key)
-			&& !v.trim().is_empty()
-		{
-			return Some(v.trim().to_string());
-		}
+	if let Ok(value) = std::env::var("COMMAND_CODE_API_KEY")
+		&& !value.trim().is_empty()
+	{
+		return Some(value.trim().to_string());
 	}
-	let home = std::env::var("HOME").ok()?;
-	let home = std::path::PathBuf::from(home);
 
-	// pi は PI_CODING_AGENT_DIR を尊重する
-	let pi_dir = std::env::var("PI_CODING_AGENT_DIR")
-		.map(std::path::PathBuf::from)
-		.unwrap_or_else(|_| home.join(".pi").join("agent"));
-
-	let candidates = [
-		home.join(".commandcode").join("auth.json"),
-		pi_dir.join("auth.json"),
-		home.join(".omp").join("agent").join("auth.json"),
-	];
-	candidates.iter().find_map(|p| read_key_file(p))
+	None
 }
 
 fn zdr_enabled() -> bool {
 	std::env::var("CMD_ZDR").as_deref() == Ok("1") || std::env::var("COMMANDCODE_ZDR").as_deref() == Ok("1")
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Client
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
-#[derive(Clone)]
-pub struct CommandCodeClient {
-	http: reqwest::Client,
+#[derive(Debug, Clone)]
+pub struct CommandCodeProvider {
+	/// Client for HTTP requests.
+	http_client: reqwest::Client,
+
 	base_url: String,
+
 	api_key: String,
 	zdr: bool,
 }
 
-impl CommandCodeClient {
-	pub fn new(api_key: impl Into<String>, base_url: impl Into<String>, zdr: bool) -> Self {
-		let http = reqwest::Client::builder()
+impl CommandCodeProvider {
+	/// Create a new instance with the given API key and base URL.
+	///
+	/// # Panics
+	/// Panics if the API key is empty or the base URL is invalid.
+	pub fn try_new(api_key: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
+		let http_client = reqwest::Client::builder()
 			.timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
 			.build()
-			.expect("reqwest client build");
-		Self {
-			http,
+			.map_err(transport)?;
+
+		Ok(Self {
+			http_client,
 			base_url: base_url.into().trim_end_matches('/').to_string(),
 			api_key: api_key.into(),
-			zdr,
-		}
+			zdr: false,
+		})
+	}
+
+	/// Create a new instance with Zero Data Retention (ZDR) enabled.
+	pub fn with_zdr(mut self, enabled: bool) -> Self {
+		self.zdr = enabled;
+		self
 	}
 
 	pub fn from_env() -> Result<Self> {
-		let api_key = load_api_key().ok_or(Error::AuthMissing)?;
-		let base_url = std::env::var("COMMANDCODE_API_BASE")
-			.ok()
-			.filter(|s| !s.trim().is_empty())
-			.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-		Ok(Self::new(api_key, base_url, zdr_enabled()))
+		let api_key = load_api_key().ok_or_else(|| {
+			Error::Config(
+				"APIキーが見つかりません。COMMAND_CODE_API_KEY を設定するか `pi` で /login してください".into(),
+			)
+		})?;
+		let provider = Self::try_new(api_key, DEFAULT_BASE_URL.to_string())?.with_zdr(zdr_enabled());
+
+		Ok(provider)
 	}
 
 	fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -145,23 +116,23 @@ impl CommandCodeClient {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for CommandCodeClient {
+impl Provider for CommandCodeProvider {
 	fn name(&self) -> &'static str {
 		"commandcode"
 	}
 
-	// -- GET /models (認証不要・Authorizationを付けると403になる) --------------
 	async fn list_models(&self) -> Result<Vec<ModelInfo>> {
 		let response = self
-			.http
+			.http_client
 			.get(format!("{}/models", self.base_url))
 			.header("accept", "application/json")
 			.timeout(std::time::Duration::from_secs(MODELS_TIMEOUT_SECS))
 			.send()
-			.await?;
+			.await
+			.map_err(transport)?;
 
 		let response = self.check_error(response).await?;
-		let wrapped: ModelsListResponse = response.json().await?;
+		let wrapped: ModelsListResponse = response.json().await.map_err(transport)?;
 
 		Ok(wrapped
 			.data
@@ -175,7 +146,6 @@ impl LlmClient for CommandCodeClient {
 			.collect())
 	}
 
-	// -- POST /chat/completions (OpenAI Chat, 非ストリーム) ------------------
 	async fn chat(&self, model: &str, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<String> {
 		let mut body = serde_json::json!({
 			"model": model,
@@ -187,14 +157,15 @@ impl LlmClient for CommandCodeClient {
 		}
 		let res = self
 			.auth(
-				self.http
+				self.http_client
 					.post(format!("{}/chat/completions", self.base_url))
 					.json(&body),
 			)
 			.send()
-			.await?;
+			.await
+			.map_err(transport)?;
 		let res = self.check_error(res).await?;
-		let parsed: ChatCompletionResponse = res.json().await?;
+		let parsed: ChatCompletionResponse = res.json().await.map_err(transport)?;
 		Ok(parsed
 			.choices
 			.into_iter()
@@ -217,19 +188,20 @@ impl LlmClient for CommandCodeClient {
 		});
 		let res = self
 			.auth(
-				self.http
+				self.http_client
 					.post(format!("{}/chat/completions", self.base_url))
 					.json(&body),
 			)
 			.send()
-			.await?;
+			.await
+			.map_err(transport)?;
 		let res = self.check_error(res).await?;
 		let mut stream = res.bytes_stream();
 		let mut buf = String::new();
 		let mut full = String::new();
 
 		while let Some(chunk) = stream.next().await {
-			let chunk = chunk?;
+			let chunk = chunk.map_err(transport)?;
 			buf.push_str(&String::from_utf8_lossy(&chunk));
 			// SSEは空行区切り
 			while let Some(pos) = buf.find("\n\n") {
@@ -263,11 +235,16 @@ impl LlmClient for CommandCodeClient {
 			"stream": false,
 		});
 		let res = self
-			.auth(self.http.post(format!("{}/responses", self.base_url)).json(&body))
+			.auth(
+				self.http_client
+					.post(format!("{}/responses", self.base_url))
+					.json(&body),
+			)
 			.send()
-			.await?;
+			.await
+			.map_err(transport)?;
 		let res = self.check_error(res).await?;
-		let v: serde_json::Value = res.json().await?;
+		let v: serde_json::Value = res.json().await.map_err(transport)?;
 		Ok(extract_responses_text(&v))
 	}
 
@@ -293,15 +270,16 @@ impl LlmClient for CommandCodeClient {
 		}
 		let res = self
 			.auth(
-				self.http
+				self.http_client
 					.post(format!("{}/messages", self.base_url))
 					.header("anthropic-version", "2023-06-01")
 					.json(&body),
 			)
 			.send()
-			.await?;
+			.await
+			.map_err(transport)?;
 		let res = self.check_error(res).await?;
-		let v: serde_json::Value = res.json().await?;
+		let v: serde_json::Value = res.json().await.map_err(transport)?;
 		// {"content":[{"type":"text","text":"..."}]}
 		let text = v
 			.get("content")

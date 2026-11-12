@@ -1,0 +1,15 @@
+[package]
+name = "letsharness-kernel"
+description = "LetsHarness kernel: extension points and shared types. Must not depend on UI or HTTP libraries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true

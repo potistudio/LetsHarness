@@ -1,8 +1,10 @@
-//! LLMプロバイダを差し替え可能にするトレイト層.
+//! LetsHarness kernel: 拡張点の trait と共有型.
 //!
-//! `main.rs` やハーネス本体はこのトレイトだけに依存し、
+//! bin やハーネス本体はこの crate だけに依存し、
 //! 具体的な実装 (`commandcode` / `mock` / 将来の他社API) を
-//! `Arc<dyn LlmClient>` として差し替えられる。
+//! `Arc<dyn Provider>` として差し替えられる。
+//!
+//! この crate は UI・HTTP ライブラリ (`clap` / `reqwest` など) に依存してはならない。
 
 use serde::{Deserialize, Serialize};
 
@@ -10,22 +12,36 @@ use serde::{Deserialize, Serialize};
 // Error
 // ---------------------------------------------------------------------------
 
+/// プラグイン側の任意のエラー. 特定実装の型を kernel に持ち込まないために使う。
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-	#[error("APIキーが見つかりません。COMMAND_CODE_API_KEY を設定するか `pi` で /login してください")]
-	AuthMissing,
-	#[error("transport: {0}")]
-	Transport(#[from] reqwest::Error),
-	#[error("io: {0}")]
-	Io(#[from] std::io::Error),
+	/// 設定不足・設定不正 (APIキー未設定など)。
+	#[error("config: {0}")]
+	Config(String),
 	#[error("APIエラー status={status} code={code:?} message={message}")]
 	Api {
 		status: u16,
 		code: Option<String>,
 		message: String,
 	},
-	#[error("mock: {0}")]
-	Mock(String),
+	/// プラグイン固有のエラー (transport / io など) を包む。
+	#[error("{plugin}: {source}")]
+	Plugin {
+		plugin: &'static str,
+		#[source]
+		source: BoxError,
+	},
+}
+
+impl Error {
+	pub fn plugin(plugin: &'static str, source: impl Into<BoxError>) -> Self {
+		Self::Plugin {
+			plugin,
+			source: source.into(),
+		}
+	}
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -69,17 +85,17 @@ impl ChatMessage {
 
 /// 差し替えポイント。すべてのLLM実装はこれを満たす.
 ///
-/// `async_trait` を使うことで `Arc<dyn LlmClient>` として
+/// `async_trait` を使うことで `Arc<dyn Provider>` として
 /// 動的ディスパッチできる (mock / 本番の差し替え、テスト容易性)。
 #[async_trait::async_trait]
-pub trait LlmClient: Send + Sync {
-	/// プロバイダ名 (`commandcode` / `mock` など)。ログ・選択用。
+pub trait Provider: Send + Sync {
+	/// Returns the name of this provider (e.g. "openai", "anthropic", "mock").
 	fn name(&self) -> &'static str;
 
-	/// GET /models 相当。認証不要な実装もあり得る。
+	/// Returns the supported models for this provider. (e.g. "deepseek/deepseek-v4.1-flash", "claude-opus-5-5").
 	async fn list_models(&self) -> Result<Vec<ModelInfo>>;
 
-	/// POST /chat/completions 相当 (非ストリーム)。
+	/// Returns the recommended wire for a given model. (e.g. "chat/completions", "responses", "messages").
 	async fn chat(&self, model: &str, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<String>;
 
 	/// POST /chat/completions 相当 (ストリーム)。

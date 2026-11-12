@@ -1,14 +1,14 @@
 //! テスト・オフライン用のモック実装.
 //!
-//! ネットワークに触れず [`crate::llm::LlmClient`] を満たすため、
+//! ネットワークに触れず [`Provider`] を満たすため、
 //! ハーネスのロジック (ルーティング・表示・ツールループ) のテストに使える。
 
-use crate::llm::{ChatMessage, Error, LlmClient, ModelInfo, Result};
+use letsharness_kernel::{ChatMessage, Error, ModelInfo, Provider, Result};
 
 #[derive(Debug, Clone, Default)]
 pub struct MockClient {
 	pub echo_prefix: String,
-	/// Someにすると全リクエストが [`Error::Mock`] で失敗する (異常系テスト用)。
+	/// Someにすると全リクエストが [`Error::Plugin`] で失敗する (異常系テスト用)。
 	pub fail_with: Option<String>,
 }
 
@@ -35,12 +35,12 @@ impl MockClient {
 	}
 
 	fn fail(&self) -> Option<Error> {
-		self.fail_with.clone().map(Error::Mock)
+		self.fail_with.clone().map(|msg| Error::plugin("mock", msg))
 	}
 }
 
 #[async_trait::async_trait]
-impl LlmClient for MockClient {
+impl Provider for MockClient {
 	fn name(&self) -> &'static str {
 		"mock"
 	}

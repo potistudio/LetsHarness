@@ -660,14 +660,41 @@ name = "letsharness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "clap",
+ "letsharness-kernel",
+ "letsharness-provider-commandcode",
+ "letsharness-provider-mock",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "letsharness-kernel"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "letsharness-provider-commandcode"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
  "futures-util",
+ "letsharness-kernel",
  "reqwest",
  "serde",
  "serde_json",
- "thiserror",
- "tokio",
+]
+
+[[package]]
+name = "letsharness-provider-mock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "letsharness-kernel",
 ]
 
 [[package]]

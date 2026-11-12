@@ -1,14 +1,10 @@
-mod commandcode;
-mod llm;
-mod mock;
-
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
-use commandcode::CommandCodeClient;
-use llm::{ChatMessage, LlmClient};
-use mock::MockClient;
+use letsharness_kernel::{self as llm, ChatMessage, Provider};
+use letsharness_provider_commandcode::CommandCodeProvider;
+use letsharness_provider_mock::MockClient;
 
 #[derive(Parser)]
 #[command(name = "letsharness", about = "Command Code Provider API をRustから直接叩く")]
@@ -31,8 +27,9 @@ struct Cli {
 enum Cmd {
 	/// GET /models 一覧
 	Models {
-		#[arg(long, default_value_t = 30)]
-		limit: usize,
+		/// 指定なしは無制限
+		#[arg(long)]
+		limit: Option<usize>,
 		#[arg(long)]
 		json: bool,
 	},
@@ -55,7 +52,7 @@ enum Cmd {
 }
 
 /// トレイト経由のファクトリ。ここを差し替えるだけで実装が切り替わる。
-fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) -> anyhow::Result<Arc<dyn LlmClient>> {
+fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) -> anyhow::Result<Arc<dyn Provider>> {
 	match provider {
 		"mock" => {
 			if let Some(msg) = mock_error {
@@ -67,7 +64,7 @@ fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) ->
 			}
 		}
 		"commandcode" => {
-			let client = CommandCodeClient::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+			let client = CommandCodeProvider::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 			Ok(Arc::new(client))
 		}
 		other => Err(anyhow::anyhow!("unknown provider: {other} (commandcode|mock)")),
@@ -85,16 +82,27 @@ async fn main() -> anyhow::Result<()> {
 			let models = client.list_models().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
 			if json {
-				println!("{}", serde_json::to_string_pretty(&models)?);
+				let out: Vec<_> = match limit {
+					Some(l) => models.iter().take(l).collect(),
+					None => models.iter().collect(),
+				};
+				println!("{}", serde_json::to_string_pretty(&out)?);
 			} else {
-				println!("[{}] {} models", client.name(), models.len());
-				for m in models.iter().take(limit) {
+				let total = models.len();
+				let shown = limit.map(|l| total.min(l)).unwrap_or(total);
+				println!("[{}] {} models (showing {} of {})", client.name(), total, shown, total);
+				for m in models.iter().take(shown) {
 					let eps = m
 						.supported_endpoints
 						.as_deref()
 						.map(|e| e.join(","))
 						.unwrap_or_else(|| "-".into());
 					println!("- {} (ctx={}, endpoints={})", m.id, m.context_length, eps);
+				}
+				if shown < total {
+					eprintln!(
+						"(truncated: showing first {shown} of {total}; omit --limit or use --limit {total} for the full list)"
+					);
 				}
 			}
 		}
@@ -115,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 /// ハーネス本体の例: 具象型ではなく `&dyn LlmClient` / `impl LlmClient` に依存する.
 /// この関数は commandcode / mock のどちらでも動く.
 async fn run_chat(
-	client: &dyn LlmClient,
+	client: &dyn Provider,
 	model: String,
 	prompt: String,
 	system: Option<String>,
@@ -186,7 +194,7 @@ mod tests {
 	use super::*;
 
 	/// 差し替え可能性の証明: 同じジェネリック関数が両実装で動く
-	async fn echo_hello(client: &impl LlmClient) -> String {
+	async fn echo_hello(client: &impl Provider) -> String {
 		client
 			.chat("any-model", vec![ChatMessage::user("hello")], None)
 			.await
@@ -204,7 +212,7 @@ mod tests {
 		assert_eq!(echo_hello(&prefixed).await, ">> any-model: hello");
 
 		// dyn 経由でも同じ
-		let dyn_client: Arc<dyn LlmClient> = Arc::new(MockClient::new());
+		let dyn_client: Arc<dyn Provider> = Arc::new(MockClient::new());
 		let models = dyn_client.list_models().await.unwrap();
 		assert!(!models.is_empty());
 	}
