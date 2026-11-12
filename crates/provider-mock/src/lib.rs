@@ -3,7 +3,7 @@
 //! ネットワークに触れず [`Provider`] を満たすため、
 //! ハーネスのロジック (ルーティング・表示・ツールループ) のテストに使える。
 
-use letsharness_kernel::{ChatMessage, Error, ModelInfo, Provider, Result};
+use letsharness_kernel::{ChatMessage, ChatOutput, Error, ModelInfo, Provider, Quota, QuotaWindow, Result, Usage};
 
 #[derive(Debug, Clone, Default)]
 pub struct MockClient {
@@ -102,5 +102,44 @@ impl Provider for MockClient {
 		_max_tokens: u32,
 	) -> Result<String> {
 		self.chat(model, messages, None).await
+	}
+
+	async fn quota(&self) -> Result<Quota> {
+		if let Some(e) = self.fail() {
+			return Err(e);
+		}
+		Ok(Quota {
+			plan: Some("mock".to_string()),
+			status: Some("active".to_string()),
+			credit_balance: Some(100.0),
+			monthly_remaining: Some(100.0),
+			purchased_credits: Some(0.0),
+			free_credits: Some(0.0),
+			five_hour: Some(QuotaWindow::new(1.0, 14.0, None, false)),
+			weekly: Some(QuotaWindow::new(2.0, 35.0, None, false)),
+			monthly: Some(QuotaWindow::new(0.0, 100.0, None, false)),
+			period_spend: Some(2.0),
+			period_tokens: Some(1000),
+			extra: serde_json::json!({"mock": true}),
+		})
+	}
+
+	async fn chat_with_usage(
+		&self,
+		model: &str,
+		messages: Vec<ChatMessage>,
+		max_tokens: Option<u32>,
+	) -> Result<ChatOutput> {
+		let text = self.chat(model, messages.clone(), max_tokens).await?;
+		let prompt = messages.iter().map(|m| m.content.len() as u64).sum::<u64>();
+		Ok(ChatOutput {
+			text,
+			usage: Some(Usage {
+				prompt_tokens: prompt,
+				completion_tokens: 3,
+				total_tokens: prompt + 3,
+				..Default::default()
+			}),
+		})
 	}
 }

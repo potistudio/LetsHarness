@@ -48,6 +48,19 @@ enum Cmd {
 		/// auto | chat | responses | messages
 		#[arg(long, default_value = "auto")]
 		route: String,
+		/// レスポンスの `usage` (prompt/completion tokens) をstderrに表示
+		#[arg(long, default_value_t = false)]
+		show_usage: bool,
+		/// テキストではなく `{text, usage}` をJSONで出す
+		#[arg(long, default_value_t = false)]
+		json: bool,
+	},
+	/// GET /alpha/billing/credits (+ subscriptions / usage/summary) の正規化
+	///
+	/// `/provider/v1/*` に課金面は無いため、CLIと同じ `/alpha` 面を叩く。
+	Quota {
+		#[arg(long)]
+		json: bool,
 	},
 }
 
@@ -113,8 +126,16 @@ async fn main() -> anyhow::Result<()> {
 			max_tokens,
 			stream,
 			route,
+			show_usage,
+			json,
 		} => {
-			run_chat(&*client, model, prompt, system, max_tokens, stream, route).await?;
+			run_chat(
+				&*client, model, prompt, system, max_tokens, stream, route, show_usage, json,
+			)
+			.await?;
+		}
+		Cmd::Quota { json } => {
+			run_quota(&*client, json).await?;
 		}
 	}
 	Ok(())
@@ -122,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// ハーネス本体の例: 具象型ではなく `&dyn LlmClient` / `impl LlmClient` に依存する.
 /// この関数は commandcode / mock のどちらでも動く.
+#[allow(clippy::too_many_arguments)]
 async fn run_chat(
 	client: &dyn Provider,
 	model: String,
@@ -130,6 +152,8 @@ async fn run_chat(
 	max_tokens: Option<u32>,
 	stream: bool,
 	route: String,
+	show_usage: bool,
+	json_output: bool,
 ) -> anyhow::Result<()> {
 	use std::io::Write;
 
@@ -156,35 +180,110 @@ async fn run_chat(
 	};
 
 	if wire == "messages" {
-		let text = client
-			.messages(&model, msgs, system.as_deref(), max_tokens.unwrap_or(1024))
+		let out = client
+			.messages_with_usage(&model, msgs, system.as_deref(), max_tokens.unwrap_or(1024))
 			.await
 			.map_err(|e| anyhow::anyhow!("{e}"))?;
-		println!("{text}");
+		emit_output(out.text, out.usage, json_output, show_usage, false);
 	} else if wire == "responses" && !stream {
 		let input = msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
-		let text = client
-			.responses(&model, &input)
+		let out = client
+			.responses_with_usage(&model, &input)
 			.await
 			.map_err(|e| anyhow::anyhow!("{e}"))?;
-		println!("{text}");
+		emit_output(out.text, out.usage, json_output, show_usage, false);
 	} else if stream {
 		let mut stdout = std::io::stdout();
 		let mut on_delta = |d: &str| {
-			print!("{d}");
-			let _ = stdout.flush();
+			if !json_output {
+				print!("{d}");
+				let _ = stdout.flush();
+			}
 		};
-		client
-			.chat_stream(&model, msgs, &mut on_delta)
+		let out = client
+			.chat_stream_with_usage(&model, msgs, &mut on_delta)
 			.await
 			.map_err(|e| anyhow::anyhow!("{e}"))?;
+		emit_output(out.text, out.usage, json_output, show_usage, !json_output);
+	} else {
+		let out = client
+			.chat_with_usage(&model, msgs, max_tokens)
+			.await
+			.map_err(|e| anyhow::anyhow!("{e}"))?;
+		emit_output(out.text, out.usage, json_output, show_usage, false);
+	}
+	Ok(())
+}
+
+fn emit_output(text: String, usage: Option<llm::Usage>, json_output: bool, show_usage: bool, stream_done: bool) {
+	if json_output {
+		let v = serde_json::json!({"text": text, "usage": usage});
+		println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+		return;
+	}
+	if stream_done {
+		// stream時は本文を逐次出しているため最後に改行だけ足す。
 		println!();
 	} else {
-		let text = client
-			.chat(&model, msgs, max_tokens)
-			.await
-			.map_err(|e| anyhow::anyhow!("{e}"))?;
 		println!("{text}");
+	}
+	if show_usage {
+		match usage {
+			Some(u) => eprintln!(
+				"usage: prompt={} completion={} total={}{} latency_ms={:?} request_id={:?}",
+				u.prompt_tokens,
+				u.completion_tokens,
+				u.total_tokens,
+				u.cached_tokens.map(|c| format!(" cached={c}")).unwrap_or_default(),
+				u.latency_ms,
+				u.request_id,
+			),
+			None => eprintln!("usage: (none)"),
+		}
+	}
+}
+
+async fn run_quota(client: &dyn Provider, json: bool) -> anyhow::Result<()> {
+	let quota = client.quota().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+	if json {
+		println!("{}", serde_json::to_string_pretty(&quota)?);
+		return Ok(());
+	}
+	println!("[{}] quota", client.name());
+	if let Some(plan) = &quota.plan {
+		let status = quota.status.as_deref().unwrap_or("-");
+		println!("plan: {plan} ({status})");
+	}
+	if let Some(b) = quota.credit_balance {
+		println!("credits: remaining={b:.4}");
+		if let Some(m) = quota.monthly_remaining {
+			println!("  monthly_remaining={m:.4}");
+		}
+	}
+	if let Some(w) = &quota.five_hour {
+		println!(
+			"5h: used={:.4} / cap={:.4} (remaining={:.4}) reset_ms={:?} exceeded={}",
+			w.used, w.cap, w.remaining, w.reset_at_ms, w.exceeded
+		);
+	}
+	if let Some(w) = &quota.weekly {
+		println!(
+			"weekly: used={:.4} / cap={:.4} (remaining={:.4}) reset_ms={:?} exceeded={}",
+			w.used, w.cap, w.remaining, w.reset_at_ms, w.exceeded
+		);
+	}
+	if let Some(w) = &quota.monthly {
+		println!(
+			"monthly: used={:.4} / cap={:.4} (remaining={:.4}) reset_ms={:?} exceeded={}",
+			w.used, w.cap, w.remaining, w.reset_at_ms, w.exceeded
+		);
+	}
+	if let Some(spend) = quota.period_spend {
+		let tokens = quota.period_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".into());
+		println!("period: spend={spend:.4} tokens={tokens}");
+	}
+	if quota.plan.is_none() && quota.credit_balance.is_none() && quota.five_hour.is_none() {
+		eprintln!("(empty quota: --json で生値を確認)");
 	}
 	Ok(())
 }
