@@ -660,10 +660,12 @@ name = "letsharness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "letsharness-kernel",
  "letsharness-provider-commandcode",
  "letsharness-provider-mock",
+ "letsharness-tool-builtin",
  "serde_json",
  "tokio",
 ]
@@ -676,6 +678,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -697,6 +700,17 @@ dependencies = [
  "async-trait",
  "letsharness-kernel",
  "serde_json",
+]
+
+[[package]]
+name = "letsharness-tool-builtin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "letsharness-kernel",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

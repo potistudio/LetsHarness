@@ -3,7 +3,10 @@
 //! ネットワークに触れず [`Provider`] を満たすため、
 //! ハーネスのロジック (ルーティング・表示・ツールループ) のテストに使える。
 
-use letsharness_kernel::{ChatMessage, ChatOutput, Error, ModelInfo, Provider, Quota, QuotaWindow, Result, Usage};
+use letsharness_kernel::{
+	ChatMessage, ChatOutput, Completion, Error, ModelInfo, Provider, Quota, QuotaWindow, Result, ToolCall, ToolSpec,
+	Usage,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct MockClient {
@@ -36,6 +39,16 @@ impl MockClient {
 
 	fn fail(&self) -> Option<Error> {
 		self.fail_with.clone().map(|msg| Error::plugin("mock", msg))
+	}
+
+	/// テスト用思考過程。モデル名に `think` を含む場合のみ返す。
+	/// 例: `--provider mock --model mock-think` で Thinking 表示を確認できる。
+	fn mock_thinking(model: &str) -> Option<String> {
+		if model.contains("think") {
+			Some(format!("mock thinking for {model}"))
+		} else {
+			None
+		}
 	}
 }
 
@@ -78,9 +91,15 @@ impl Provider for MockClient {
 		model: &str,
 		messages: Vec<ChatMessage>,
 		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
 	) -> Result<String> {
 		let full = self.chat(model, messages, None).await?;
-		// モックは一括→分割配送でストリームを模す
+		// モックは一括→分割配送でストリームを模す (thinking も同様)
+		if let Some(thinking) = Self::mock_thinking(model) {
+			for chunk in thinking.split_inclusive(' ') {
+				on_thinking(chunk);
+			}
+		}
 		for chunk in full.split_inclusive(' ') {
 			on_delta(chunk);
 		}
@@ -134,12 +153,117 @@ impl Provider for MockClient {
 		let prompt = messages.iter().map(|m| m.content.len() as u64).sum::<u64>();
 		Ok(ChatOutput {
 			text,
+			thinking: Self::mock_thinking(model),
 			usage: Some(Usage {
 				prompt_tokens: prompt,
 				completion_tokens: 3,
 				total_tokens: prompt + 3,
 				..Default::default()
 			}),
+		})
+	}
+
+	async fn chat_stream_with_usage(
+		&self,
+		model: &str,
+		messages: Vec<ChatMessage>,
+		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
+	) -> Result<ChatOutput> {
+		let mut thinking_buf = String::new();
+		let text = {
+			let buf = &mut thinking_buf;
+			let wrapped: &mut (dyn for<'a> FnMut(&'a str) + Send) = &mut |chunk: &str| {
+				buf.push_str(chunk);
+				on_thinking(chunk);
+			};
+			self.chat_stream(model, messages.clone(), on_delta, wrapped).await?
+		};
+		let prompt = messages.iter().map(|m| m.content.len() as u64).sum::<u64>();
+		Ok(ChatOutput {
+			text,
+			thinking: ChatOutput::normalized_thinking(Some(thinking_buf)),
+			usage: Some(Usage {
+				prompt_tokens: prompt,
+				completion_tokens: 3,
+				total_tokens: prompt + 3,
+				..Default::default()
+			}),
+		})
+	}
+
+	/// 台本ツール呼び出し。直近が user で本文が `tool:<name> <JSON引数>` なら
+	/// そのツールを呼ぶ。直近が tool 結果なら結果を引用して終える。それ以外はエコー。
+	/// ネットワーク無しでエージェントループを通せる。
+	async fn chat_with_tools(
+		&self,
+		model: &str,
+		messages: Vec<ChatMessage>,
+		tools: &[ToolSpec],
+		max_tokens: Option<u32>,
+	) -> Result<Completion> {
+		if let Some(e) = self.fail() {
+			return Err(e);
+		}
+		let last = messages.last();
+		if let Some(m) = last.filter(|m| m.role == "tool") {
+			return Ok(Completion {
+				text: format!("{}tool result: {}", self.echo_prefix, m.content),
+				..Default::default()
+			});
+		}
+		if !tools.is_empty()
+			&& let Some(rest) = last
+				.filter(|m| m.role == "user")
+				.and_then(|m| m.content.strip_prefix("tool:"))
+		{
+			let (name, args) = rest.split_once(' ').unwrap_or((rest, ""));
+			let arguments = if args.trim().is_empty() {
+				serde_json::json!({})
+			} else {
+				serde_json::from_str(args)
+					.map_err(|e| Error::plugin("mock", format!("tool: の引数がJSONではない: {e}")))?
+			};
+			return Ok(Completion {
+				text: format!("{}calling {name}", self.echo_prefix),
+				tool_calls: vec![ToolCall {
+					id: format!("mock_call_{}", messages.len()),
+					name: name.to_string(),
+					arguments,
+				}],
+				..Default::default()
+			});
+		}
+		let out = self.chat_with_usage(model, messages, max_tokens).await?;
+		Ok(Completion {
+			text: out.text,
+			thinking: out.thinking,
+			tool_calls: Vec::new(),
+			usage: out.usage,
+		})
+	}
+
+	async fn responses_with_usage(&self, model: &str, input: &str) -> Result<ChatOutput> {
+		let text = self.responses(model, input).await?;
+		Ok(ChatOutput {
+			text,
+			thinking: Self::mock_thinking(model),
+			usage: None,
+		})
+	}
+
+	async fn messages_with_usage(
+		&self,
+		model: &str,
+		messages: Vec<ChatMessage>,
+		system: Option<&str>,
+		max_tokens: u32,
+	) -> Result<ChatOutput> {
+		let text = self.messages(model, messages, system, max_tokens).await?;
+		Ok(ChatOutput {
+			text,
+			thinking: Self::mock_thinking(model),
+			usage: None,
 		})
 	}
 }

@@ -1,3 +1,5 @@
+mod agent;
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -51,9 +53,12 @@ enum Cmd {
 		/// レスポンスの `usage` (prompt/completion tokens) をstderrに表示
 		#[arg(long, default_value_t = false)]
 		show_usage: bool,
-		/// テキストではなく `{text, usage}` をJSONで出す
+		/// テキストではなく `{text, thinking, usage, stats}` をJSONで出す
 		#[arg(long, default_value_t = false)]
 		json: bool,
+		/// 思考過程 (reasoning / extended thinking) を表示しない (既定は表示)
+		#[arg(long, default_value_t = false)]
+		no_thinking: bool,
 	},
 	/// GET /alpha/billing/credits (+ subscriptions / usage/summary) の正規化
 	///
@@ -61,6 +66,35 @@ enum Cmd {
 	Quota {
 		#[arg(long)]
 		json: bool,
+	},
+	/// ツールを使いながら最終回答まで自走する (非ストリーム)
+	///
+	/// 同梱ツール: read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
+	/// 承認は実行ごとに stderr で確認する。`--yes` で全承認 (bash は何でも実行できるので注意)。
+	Agent {
+		#[arg(long)]
+		model: String,
+		#[arg(long)]
+		prompt: String,
+		#[arg(long)]
+		system: Option<String>,
+		#[arg(long)]
+		max_tokens: Option<u32>,
+		/// モデル呼び出しの上限回数 (暴走防止)
+		#[arg(long, default_value_t = llm::DEFAULT_MAX_STEPS)]
+		max_steps: usize,
+		/// ツールの作業ディレクトリ。ファイル系ツールはこの外に出られない
+		#[arg(long, default_value = ".")]
+		workdir: std::path::PathBuf,
+		/// 承認が必要なツールを確認なしで実行する
+		#[arg(long, default_value_t = false)]
+		yes: bool,
+		/// 思考過程を表示しない
+		#[arg(long, default_value_t = false)]
+		no_thinking: bool,
+		/// 全ステップ合算の usage をstderrに表示
+		#[arg(long, default_value_t = false)]
+		show_usage: bool,
 	},
 }
 
@@ -128,14 +162,51 @@ async fn main() -> anyhow::Result<()> {
 			route,
 			show_usage,
 			json,
+			no_thinking,
 		} => {
 			run_chat(
-				&*client, model, prompt, system, max_tokens, stream, route, show_usage, json,
+				&*client,
+				model,
+				prompt,
+				system,
+				max_tokens,
+				stream,
+				route,
+				show_usage,
+				json,
+				no_thinking,
 			)
 			.await?;
 		}
 		Cmd::Quota { json } => {
 			run_quota(&*client, json).await?;
+		}
+		Cmd::Agent {
+			model,
+			prompt,
+			system,
+			max_tokens,
+			max_steps,
+			workdir,
+			yes,
+			no_thinking,
+			show_usage,
+		} => {
+			agent::run(
+				client,
+				agent::Options {
+					model,
+					prompt,
+					system,
+					max_tokens,
+					max_steps,
+					workdir,
+					yes,
+					no_thinking,
+					show_usage,
+				},
+			)
+			.await?;
 		}
 	}
 	Ok(())
@@ -154,6 +225,7 @@ async fn run_chat(
 	route: String,
 	show_usage: bool,
 	json_output: bool,
+	no_thinking: bool,
 ) -> anyhow::Result<()> {
 	use std::io::Write;
 
@@ -184,42 +256,138 @@ async fn run_chat(
 			.messages_with_usage(&model, msgs, system.as_deref(), max_tokens.unwrap_or(1024))
 			.await
 			.map_err(|e| anyhow::anyhow!("{e}"))?;
-		emit_output(out.text, out.usage, json_output, show_usage, false);
+		emit_output(
+			out.text,
+			out.thinking,
+			out.usage,
+			json_output,
+			show_usage,
+			false,
+			no_thinking,
+		);
 	} else if wire == "responses" && !stream {
 		let input = msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
 		let out = client
 			.responses_with_usage(&model, &input)
 			.await
 			.map_err(|e| anyhow::anyhow!("{e}"))?;
-		emit_output(out.text, out.usage, json_output, show_usage, false);
+		emit_output(
+			out.text,
+			out.thinking,
+			out.usage,
+			json_output,
+			show_usage,
+			false,
+			no_thinking,
+		);
 	} else if stream {
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
 		let mut stdout = std::io::stdout();
+		// Thinking は本文とは別に stderr へ逐次出す。JSON時・--no-thinking時は抑止。
+		// 本文の最初のデルタが来たら思考ブロックを閉じる (thinking→text の順で読みやすく)。
+		let thinking_open = Arc::new(AtomicBool::new(false));
+		let thinking_closed = Arc::new(AtomicBool::new(false));
+		let thinking_open_delta = Arc::clone(&thinking_open);
+		let thinking_closed_delta = Arc::clone(&thinking_closed);
 		let mut on_delta = |d: &str| {
-			if !json_output {
-				print!("{d}");
-				let _ = stdout.flush();
+			if json_output {
+				return;
 			}
+			if !no_thinking
+				&& thinking_open_delta.load(Ordering::SeqCst)
+				&& !thinking_closed_delta.load(Ordering::SeqCst)
+			{
+				eprintln!("\n--- end of thinking ---");
+				thinking_closed_delta.store(true, Ordering::SeqCst);
+			}
+			print!("{d}");
+			let _ = stdout.flush();
+		};
+		let thinking_open_th = Arc::clone(&thinking_open);
+		let thinking_closed_th = Arc::clone(&thinking_closed);
+		let mut on_thinking = |t: &str| {
+			if json_output || no_thinking {
+				return;
+			}
+			// 本文開始後に思考が来る稀な形ではブロックを再開する。
+			if thinking_closed_th.load(Ordering::SeqCst) {
+				thinking_closed_th.store(false, Ordering::SeqCst);
+			}
+			if !thinking_open_th.load(Ordering::SeqCst) {
+				eprintln!("--- thinking ---");
+				thinking_open_th.store(true, Ordering::SeqCst);
+			}
+			eprint!("{t}");
+			let _ = std::io::stderr().flush();
 		};
 		let out = client
-			.chat_stream_with_usage(&model, msgs, &mut on_delta)
+			.chat_stream_with_usage(&model, msgs, &mut on_delta, &mut on_thinking)
 			.await
 			.map_err(|e| anyhow::anyhow!("{e}"))?;
-		emit_output(out.text, out.usage, json_output, show_usage, !json_output);
+		let header_printed = thinking_open.load(Ordering::SeqCst);
+		let closed = thinking_closed.load(Ordering::SeqCst);
+		if header_printed && !closed && !json_output && !no_thinking {
+			eprintln!("\n--- end of thinking ---");
+		}
+		// 人間向け表示ではライブ表示済みのため再表示しない (Noneを渡す)。
+		// JSON時は結果に含める必要があるためそのまま渡す。
+		let thinking_for_output = if json_output {
+			out.thinking
+		} else if header_printed {
+			None
+		} else {
+			out.thinking
+		};
+		emit_output(
+			out.text,
+			thinking_for_output,
+			out.usage,
+			json_output,
+			show_usage,
+			!json_output,
+			no_thinking,
+		);
 	} else {
 		let out = client
 			.chat_with_usage(&model, msgs, max_tokens)
 			.await
 			.map_err(|e| anyhow::anyhow!("{e}"))?;
-		emit_output(out.text, out.usage, json_output, show_usage, false);
+		emit_output(
+			out.text,
+			out.thinking,
+			out.usage,
+			json_output,
+			show_usage,
+			false,
+			no_thinking,
+		);
 	}
 	Ok(())
 }
 
-fn emit_output(text: String, usage: Option<llm::Usage>, json_output: bool, show_usage: bool, stream_done: bool) {
+#[allow(clippy::too_many_arguments)]
+fn emit_output(
+	text: String,
+	thinking: Option<String>,
+	usage: Option<llm::Usage>,
+	json_output: bool,
+	show_usage: bool,
+	stream_done: bool,
+	no_thinking: bool,
+) {
+	// --no-thinking 時は思考過程を捨てる (JSON の thinking も null になる)。
+	let thinking = if no_thinking { None } else { thinking };
+	let thinking = thinking.filter(|t| !t.trim().is_empty());
 	if json_output {
-		let v = serde_json::json!({"text": text, "usage": usage});
+		let stats = usage.as_ref().map(llm::Usage::stats);
+		let v = serde_json::json!({"text": text, "thinking": thinking, "usage": usage, "stats": stats});
 		println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
 		return;
+	}
+	// Thinking は本文より先に stderr へ。stdout は text のみでパイプ可能に保つ。
+	if let Some(t) = thinking.as_deref() {
+		eprintln!("--- thinking ---\n{t}\n--- end of thinking ---");
 	}
 	if stream_done {
 		// stream時は本文を逐次出しているため最後に改行だけ足す。
@@ -229,26 +397,55 @@ fn emit_output(text: String, usage: Option<llm::Usage>, json_output: bool, show_
 	}
 	if show_usage {
 		match usage {
-			Some(u) => eprintln!(
-				"usage: prompt={} completion={} total={}{} latency_ms={:?} request_id={:?}",
-				u.prompt_tokens,
-				u.completion_tokens,
-				u.total_tokens,
-				u.cached_tokens.map(|c| format!(" cached={c}")).unwrap_or_default(),
-				u.latency_ms,
-				u.request_id,
-			),
+			Some(u) => eprintln!("{}", format_usage(&u)),
 			None => eprintln!("usage: (none)"),
 		}
 	}
 }
 
+/// `usage: in=.. (cached=.. NN.N%, uncached=..) out=.. total=.. tok/s=.. ...`
+fn format_usage(u: &llm::Usage) -> String {
+	let s = u.stats();
+	let mut cache = match s.cache_hit_pct {
+		Some(pct) => format!(
+			" (cached={} {pct:.1}%, uncached={}",
+			s.cached_tokens, s.uncached_input_tokens
+		),
+		None => String::new(),
+	};
+	if let Some(w) = u.cache_write_tokens {
+		cache.push_str(if cache.is_empty() { " (" } else { ", " });
+		cache.push_str(&format!("cache_write={w}"));
+	}
+	if !cache.is_empty() {
+		cache.push(')');
+	}
+	let reasoning = u
+		.reasoning_tokens
+		.map(|r| format!(" (reasoning={r})"))
+		.unwrap_or_default();
+	let tps = s
+		.output_tokens_per_sec
+		.map(|t| format!("{t:.1}"))
+		.unwrap_or_else(|| "-".into());
+	let ttft = u.ttft_ms.map(|t| format!(" ttft_ms={t}")).unwrap_or_default();
+	let latency = u.latency_ms.map(|l| l.to_string()).unwrap_or_else(|| "-".into());
+	let request_id = u.request_id.as_deref().unwrap_or("-");
+	format!(
+		"usage: in={}{cache} out={}{reasoning} total={} tok/s={tps} latency_ms={latency}{ttft} request_id={request_id}",
+		s.input_tokens, s.output_tokens, u.total_tokens,
+	)
+}
+
+/// Calls `client.quota()` and prints the result in a human-readable format or JSON.
 async fn run_quota(client: &dyn Provider, json: bool) -> anyhow::Result<()> {
-	let quota = client.quota().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+	let quota = client.quota().await?;
+
 	if json {
 		println!("{}", serde_json::to_string_pretty(&quota)?);
 		return Ok(());
 	}
+
 	println!("[{}] quota", client.name());
 	if let Some(plan) = &quota.plan {
 		let status = quota.status.as_deref().unwrap_or("-");
@@ -318,6 +515,34 @@ mod tests {
 		let dyn_client: Arc<dyn Provider> = Arc::new(MockClient::new());
 		let models = dyn_client.list_models().await.unwrap();
 		assert!(!models.is_empty());
+	}
+
+	#[test]
+	fn format_usage_line() {
+		let u = llm::Usage {
+			prompt_tokens: 200,
+			completion_tokens: 50,
+			total_tokens: 250,
+			cached_tokens: Some(150),
+			latency_ms: Some(1500),
+			ttft_ms: Some(500),
+			request_id: Some("r1".into()),
+			..Default::default()
+		};
+		assert_eq!(
+			format_usage(&u),
+			"usage: in=200 (cached=150 75.0%, uncached=50) out=50 total=250 tok/s=50.0 latency_ms=1500 ttft_ms=500 request_id=r1"
+		);
+		let bare = llm::Usage {
+			prompt_tokens: 3,
+			completion_tokens: 3,
+			total_tokens: 6,
+			..Default::default()
+		};
+		assert_eq!(
+			format_usage(&bare),
+			"usage: in=3 out=3 total=6 tok/s=- latency_ms=- request_id=-"
+		);
 	}
 
 	#[tokio::test]

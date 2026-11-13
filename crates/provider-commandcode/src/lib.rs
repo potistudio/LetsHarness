@@ -20,9 +20,17 @@
 //! - 月次capはAPIが返さない。CLIと同じくプランIDから [`plan_monthly_credits`]
 //!   で引き、`max(cap, monthlyCredits)` を実効capとする。
 
+mod tools;
+
 use futures_util::StreamExt;
 
-use letsharness_kernel::{ChatMessage, ChatOutput, Error, ModelInfo, Provider, Quota, QuotaWindow, Result, Usage};
+use letsharness_kernel::{
+	ChatMessage, ChatOutput, Completion, Error, ModelInfo, Provider, Quota, QuotaWindow, Result, ToolSpec, Usage,
+};
+
+use crate::tools::{
+	build_chat_tools_body, build_messages_tools_body, parse_chat_tools_response, parse_messages_tools_response,
+};
 
 const PLUGIN: &str = "commandcode";
 
@@ -325,12 +333,13 @@ impl Provider for CommandCodeProvider {
 			.and_then(|c| c.as_str())
 			.unwrap_or_default()
 			.to_string();
+		let thinking = v.pointer("/choices/0/message").and_then(extract_chat_message_thinking);
 		let mut usage = v.get("usage").and_then(Usage::from_value);
 		if let Some(u) = usage.as_mut() {
 			u.latency_ms = Some(started.elapsed().as_millis() as u64);
 			u.request_id = request_id.or_else(|| v.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()));
 		}
-		Ok(ChatOutput { text, usage })
+		Ok(ChatOutput { text, thinking, usage })
 	}
 
 	// -- POST /chat/completions (ストリーム, SSE) -----------------------------
@@ -339,8 +348,12 @@ impl Provider for CommandCodeProvider {
 		model: &str,
 		messages: Vec<ChatMessage>,
 		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
 	) -> Result<String> {
-		Ok(self.chat_stream_with_usage(model, messages, on_delta).await?.text)
+		Ok(self
+			.chat_stream_with_usage(model, messages, on_delta, on_thinking)
+			.await?
+			.text)
 	}
 
 	async fn chat_stream_with_usage(
@@ -348,6 +361,7 @@ impl Provider for CommandCodeProvider {
 		model: &str,
 		messages: Vec<ChatMessage>,
 		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
 	) -> Result<ChatOutput> {
 		let started = std::time::Instant::now();
 		let body = serde_json::json!({
@@ -370,7 +384,9 @@ impl Provider for CommandCodeProvider {
 		let mut stream = res.bytes_stream();
 		let mut buf = String::new();
 		let mut full = String::new();
+		let mut thinking_buf = String::new();
 		let mut usage: Option<Usage> = None;
+		let mut ttft_ms: Option<u64> = None;
 
 		while let Some(chunk) = stream.next().await {
 			let chunk = chunk.map_err(transport)?;
@@ -393,7 +409,19 @@ impl Provider for CommandCodeProvider {
 					if let Some(u) = v.get("usage").and_then(Usage::from_value) {
 						usage = Some(u);
 					}
+					// 思考差分 (DeepSeek系 reasoning_content / thinking 系)。
+					// テキストより先に届くことが多いため TTFT 判定にも含める。
+					if let Some(delta) = v.pointer("/choices/0/delta").and_then(extract_chat_message_thinking) {
+						if ttft_ms.is_none() && !delta.is_empty() {
+							ttft_ms = Some(started.elapsed().as_millis() as u64);
+						}
+						thinking_buf.push_str(&delta);
+						on_thinking(&delta);
+					}
 					if let Some(delta) = v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
+						if ttft_ms.is_none() && !delta.is_empty() {
+							ttft_ms = Some(started.elapsed().as_millis() as u64);
+						}
 						full.push_str(delta);
 						on_delta(delta);
 					}
@@ -402,9 +430,57 @@ impl Provider for CommandCodeProvider {
 		}
 		if let Some(u) = usage.as_mut() {
 			u.latency_ms = Some(started.elapsed().as_millis() as u64);
+			u.ttft_ms = ttft_ms;
 			u.request_id = request_id;
 		}
-		Ok(ChatOutput { text: full, usage })
+		Ok(ChatOutput {
+			text: full,
+			thinking: ChatOutput::normalized_thinking(Some(thinking_buf)),
+			usage,
+		})
+	}
+
+	// -- ツール付き1ターン (非ストリーム): claude-* は /messages、他は /chat/completions --
+	async fn chat_with_tools(
+		&self,
+		model: &str,
+		messages: Vec<ChatMessage>,
+		tools: &[ToolSpec],
+		max_tokens: Option<u32>,
+	) -> Result<Completion> {
+		let started = std::time::Instant::now();
+		let anthropic = letsharness_kernel::route_for_model(model, None) == "messages";
+		let (path, body) = if anthropic {
+			(
+				"messages",
+				build_messages_tools_body(model, &messages, tools, max_tokens),
+			)
+		} else {
+			(
+				"chat/completions",
+				build_chat_tools_body(model, &messages, tools, max_tokens),
+			)
+		};
+		let mut req = self.http_client.post(format!("{}/{path}", self.base_url));
+		if anthropic {
+			req = req.header("anthropic-version", "2023-06-01");
+		}
+		let res = self.auth(req.json(&body)).send().await.map_err(transport)?;
+		let request_id = header_request_id(&res);
+		let res = self.check_error(res).await?;
+		let v: serde_json::Value = res.json().await.map_err(transport)?;
+
+		let mut completion = if anthropic {
+			parse_messages_tools_response(&v)
+		} else {
+			parse_chat_tools_response(&v)
+		};
+		completion.usage = v.get("usage").and_then(Usage::from_value);
+		if let Some(u) = completion.usage.as_mut() {
+			u.latency_ms = Some(started.elapsed().as_millis() as u64);
+			u.request_id = request_id.or_else(|| v.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()));
+		}
+		Ok(completion)
 	}
 
 	// -- POST /responses (OpenAI Responses, 非ストリーム) ---------------------
@@ -432,12 +508,13 @@ impl Provider for CommandCodeProvider {
 		let res = self.check_error(res).await?;
 		let v: serde_json::Value = res.json().await.map_err(transport)?;
 		let text = extract_responses_text(&v);
+		let thinking = extract_responses_thinking(&v);
 		let mut usage = v.get("usage").and_then(Usage::from_value);
 		if let Some(u) = usage.as_mut() {
 			u.latency_ms = Some(started.elapsed().as_millis() as u64);
 			u.request_id = request_id.or_else(|| v.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()));
 		}
-		Ok(ChatOutput { text, usage })
+		Ok(ChatOutput { text, thinking, usage })
 	}
 
 	// -- POST /messages (Anthropic Messages, Claude系, 非ストリーム) ---------
@@ -487,23 +564,27 @@ impl Provider for CommandCodeProvider {
 		let request_id = header_request_id(&res);
 		let res = self.check_error(res).await?;
 		let v: serde_json::Value = res.json().await.map_err(transport)?;
-		// {"content":[{"type":"text","text":"..."}]}
+		// {"content":[{"type":"text","text":"..."},{"type":"thinking","thinking":"..."}]}
+		// thinking系ブロックの `thinking` は本文に混ぜない。
 		let text = v
 			.get("content")
 			.and_then(|c| c.as_array())
 			.map(|arr| {
 				arr.iter()
+					.filter(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking"))
+					.filter(|b| b.get("type").and_then(|t| t.as_str()) != Some("redacted_thinking"))
 					.filter_map(|b| b.get("text").and_then(|t| t.as_str()))
 					.collect::<Vec<_>>()
 					.join("")
 			})
 			.unwrap_or_default();
+		let thinking = extract_messages_thinking(&v);
 		let mut usage = v.get("usage").and_then(Usage::from_value);
 		if let Some(u) = usage.as_mut() {
 			u.latency_ms = Some(started.elapsed().as_millis() as u64);
 			u.request_id = request_id.or_else(|| v.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()));
 		}
-		Ok(ChatOutput { text, usage })
+		Ok(ChatOutput { text, thinking, usage })
 	}
 }
 
@@ -669,6 +750,123 @@ struct RawModel {
 	supported_endpoints: Option<Vec<String>>,
 }
 
+// ---------------------------------------------------------------------------
+// Thinking 抽出 (3wire)
+// ---------------------------------------------------------------------------
+
+/// `Value` から思考テキスト1片を取り出す。文字列ならそのまま、
+/// オブジェクトなら `text` / `content` / `thinking` / `reasoning_content` を見る。
+fn thinking_str_fragment(v: &serde_json::Value) -> Option<String> {
+	if let Some(s) = v.as_str() {
+		return if s.is_empty() { None } else { Some(s.to_string()) };
+	}
+	if let Some(obj) = v.as_object() {
+		for key in ["text", "content", "thinking", "reasoning_content", "reasoning"] {
+			if let Some(inner) = obj.get(key) {
+				if let Some(s) = inner.as_str()
+					&& !s.is_empty()
+				{
+					return Some(s.to_string());
+				}
+				// `reasoning: {content: "..."}` のような一段ネストにも対応。
+				if inner.is_object()
+					&& let Some(s) = thinking_str_fragment(inner)
+				{
+					return Some(s);
+				}
+			}
+		}
+	}
+	None
+}
+
+/// 空・空白のみを `None` に潰し、複数片を結合する。
+fn join_thinking(parts: Vec<String>) -> Option<String> {
+	let joined = parts.join("");
+	if joined.trim().is_empty() { None } else { Some(joined) }
+}
+
+/// Chat Completions の `message` / `delta` オブジェクトから思考過程を抜く。
+///
+/// - DeepSeek/Qwen系: `reasoning_content` (string)
+/// - 一部互換API: `reasoning` (string | {content/text}) / `thinking` (string)
+/// - content配列型: `{type: reasoning/thinking, text/thinking: "..."}`
+fn extract_chat_message_thinking(msg: &serde_json::Value) -> Option<String> {
+	let mut parts = Vec::new();
+	for key in ["reasoning_content", "reasoning", "thinking"] {
+		if let Some(v) = msg.get(key)
+			&& let Some(s) = thinking_str_fragment(v)
+		{
+			parts.push(s);
+		}
+	}
+	// content が配列の場合 (例: [{type:"reasoning", text:"..."}]) も拾う。
+	if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+		for item in arr {
+			let t = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+			if (t.contains("reasoning") || t.contains("thinking"))
+				&& let Some(s) = thinking_str_fragment(item)
+			{
+				parts.push(s);
+			}
+		}
+	}
+	if parts.is_empty() { None } else { join_thinking(parts) }
+}
+
+/// Responses API (`output: [{type: reasoning, summary: [{text}]}, ...]`) の思考過程。
+fn extract_responses_thinking(v: &serde_json::Value) -> Option<String> {
+	let output = v.get("output")?.as_array()?;
+	let mut parts = Vec::new();
+	for item in output {
+		if item.get("type").and_then(|t| t.as_str()) != Some("reasoning") {
+			continue;
+		}
+		// summary: [{type: summary_text, text: "..."}]
+		if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
+			for s in summary {
+				if let Some(t) = s.get("text").and_then(|t| t.as_str()) {
+					parts.push(t.to_string());
+				}
+			}
+		}
+		// content: [{text: "..."}] 形式のフォールバック。
+		if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+			for c in content {
+				if let Some(s) = thinking_str_fragment(c) {
+					parts.push(s);
+				}
+			}
+		}
+	}
+	if parts.is_empty() { None } else { join_thinking(parts) }
+}
+
+/// Messages API (`content: [{type: thinking, thinking: "..."}]`) の思考過程。
+fn extract_messages_thinking(v: &serde_json::Value) -> Option<String> {
+	let content = v.get("content")?.as_array()?;
+	let mut parts = Vec::new();
+	for block in content {
+		match block.get("type").and_then(|t| t.as_str()) {
+			Some("thinking") => {
+				if let Some(s) = block.get("thinking").and_then(|t| t.as_str()) {
+					parts.push(s.to_string());
+				}
+			}
+			Some("redacted_thinking") => {
+				parts.push("[redacted thinking]".to_string());
+			}
+			Some(t) if t.contains("reasoning") => {
+				if let Some(s) = thinking_str_fragment(block) {
+					parts.push(s);
+				}
+			}
+			_ => {}
+		}
+	}
+	if parts.is_empty() { None } else { join_thinking(parts) }
+}
+
 // Responses APIのテキスト抽出: output_text優先、なければ再帰走査
 fn extract_responses_text(v: &serde_json::Value) -> String {
 	if let Some(s) = v.get("output_text").and_then(|t| t.as_str()) {
@@ -821,12 +1019,62 @@ mod tests {
 		}))
 		.unwrap();
 		assert_eq!((u.prompt_tokens, u.completion_tokens), (138, 4));
-		// messages (anthropic)
+		// messages (anthropic): input_tokens はキャッシュ外数なので足し込む
 		let u = Usage::from_value(&serde_json::json!({
 			"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 8
 		}))
 		.unwrap();
+		assert_eq!(u.prompt_tokens, 18);
 		assert_eq!(u.cached_tokens, Some(8));
-		assert_eq!(u.total_tokens, 15);
+		assert_eq!(u.total_tokens, 23);
+	}
+
+	#[test]
+	fn thinking_chat_message_covers_major_shapes() {
+		// DeepSeek系 reasoning_content
+		let m = serde_json::json!({"role": "assistant", "content": "hi", "reasoning_content": "think1"});
+		assert_eq!(extract_chat_message_thinking(&m).as_deref(), Some("think1"));
+		// reasoning: string
+		let m = serde_json::json!({"reasoning": "think2"});
+		assert_eq!(extract_chat_message_thinking(&m).as_deref(), Some("think2"));
+		// reasoning: {content} / thinking: string
+		let m = serde_json::json!({"reasoning": {"content": "think3"}, "thinking": "think4"});
+		assert_eq!(extract_chat_message_thinking(&m).as_deref(), Some("think3think4"));
+		// delta でも同じ抽出が使える
+		let d = serde_json::json!({"reasoning_content": "delta-think"});
+		assert_eq!(extract_chat_message_thinking(&d).as_deref(), Some("delta-think"));
+		// content配列型
+		let m = serde_json::json!({"content": [{"type": "reasoning", "text": "arr-think"}]});
+		assert_eq!(extract_chat_message_thinking(&m).as_deref(), Some("arr-think"));
+		// 無ければ None (本文のみ)
+		let m = serde_json::json!({"role": "assistant", "content": "hi"});
+		assert_eq!(extract_chat_message_thinking(&m), None);
+		// 空文字は None
+		let m = serde_json::json!({"reasoning_content": ""});
+		assert_eq!(extract_chat_message_thinking(&m), None);
+	}
+
+	#[test]
+	fn thinking_responses_and_messages() {
+		let v = serde_json::json!({
+			"output": [
+				{"type": "reasoning", "summary": [{"type": "summary_text", "text": "sum1"}]},
+				{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}
+			]
+		});
+		assert_eq!(extract_responses_thinking(&v).as_deref(), Some("sum1"));
+		assert_eq!(extract_responses_text(&v), "hi");
+		assert_eq!(extract_responses_thinking(&serde_json::json!({"output": []})), None);
+
+		let v = serde_json::json!({
+			"content": [
+				{"type": "thinking", "thinking": "msg-think"},
+				{"type": "text", "text": "hi"}
+			]
+		});
+		assert_eq!(extract_messages_thinking(&v).as_deref(), Some("msg-think"));
+		let v = serde_json::json!({"content": [{"type": "redacted_thinking", "data": "xxx"}]});
+		assert_eq!(extract_messages_thinking(&v).as_deref(), Some("[redacted thinking]"));
+		assert_eq!(extract_messages_thinking(&serde_json::json!({"content": []})), None);
 	}
 }

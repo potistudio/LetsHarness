@@ -15,6 +15,7 @@ repository = "https://github.com/potistudio/LetsHarness"
 letsharness-kernel = { path = "crates/kernel" }
 letsharness-provider-commandcode = { path = "crates/provider-commandcode" }
 letsharness-provider-mock = { path = "crates/provider-mock" }
+letsharness-tool-builtin = { path = "crates/tool-builtin" }
 
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
