@@ -12,6 +12,7 @@ publish = false
 repository = "https://github.com/potistudio/LetsHarness"
 
 [workspace.dependencies]
+letsharness-agent-antigravity = { path = "crates/agent-antigravity" }
 letsharness-kernel = { path = "crates/kernel" }
 letsharness-plugin-dotenv = { path = "crates/plugin-dotenv" }
 letsharness-provider-commandcode = { path = "crates/provider-commandcode" }

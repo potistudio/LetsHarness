@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// モデルに見せるツール定義。
+/// Tool definition.
+///
+/// This is passed to the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
 	/// The name of the tool.

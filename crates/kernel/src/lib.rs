@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 mod agent;
 mod tool;
 
-pub use agent::{AgentHandler, AgentOutcome, AgentRequest, DEFAULT_MAX_STEPS, run_agent};
+pub use agent::{
+	AgentBackend, AgentHandler, AgentOutcome, AgentRequest, ApprovalPolicy, BuiltinAgent, DEFAULT_MAX_STEPS, run_agent,
+};
 pub use tool::{Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
 // ---------------------------------------------------------------------------

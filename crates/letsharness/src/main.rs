@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
-use letsharness_kernel::{self as llm, ChatMessage, Provider};
+use letsharness_agent_antigravity::AntigravityAgent;
+use letsharness_kernel::{self as llm, AgentBackend, ChatMessage, Provider};
 use letsharness_provider_commandcode::CommandCodeProvider;
 use letsharness_provider_gemini::GeminiProvider;
 use letsharness_provider_mock::MockClient;
@@ -12,9 +13,15 @@ use letsharness_provider_mock::MockClient;
 #[derive(Parser)]
 #[command(name = "letsharness", about = "Command Code Provider API をRustから直接叩く")]
 struct Cli {
-	/// 差し替えポイント: commandcode | gemini | mock
+	/// モデルの差し替えポイント: commandcode | gemini | mock
 	#[arg(long, global = true, default_value = "commandcode")]
 	provider: String,
+	/// エージェントの担い手 (`agent` / `models` で有効)
+	///
+	/// builtin     : --provider のモデル + 同梱ツールで LetsHarness がループを回す
+	/// antigravity : Antigravity CLI (`agy`) に丸ごと任せる (ツール・認証も agy 側)
+	#[arg(long, global = true, default_value = "builtin")]
+	backend: String,
 	/// mock用: 応答prefix (provider=mock時のみ)
 	#[arg(long, global = true, default_value = "")]
 	mock_prefix: String,
@@ -41,9 +48,11 @@ enum Cmd {
 		/// 指定なしは無制限
 		#[arg(long)]
 		limit: Option<usize>,
+
 		#[arg(long)]
 		json: bool,
 	},
+
 	/// POST /chat/completions (Claudeは自動で/messagesに切替)
 	Chat {
 		#[arg(long)]
@@ -78,11 +87,15 @@ enum Cmd {
 	},
 	/// ツールを使いながら最終回答まで自走する (非ストリーム)
 	///
-	/// 同梱ツール: read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
+	/// --backend builtin: 同梱ツール read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
 	/// 承認は実行ごとに stderr で確認する。`--yes` で全承認 (bash は何でも実行できるので注意)。
+	///
+	/// --backend antigravity: agy が自分のツールで動く。承認はこちらに求められず、
+	/// agy の権限設定で許可されていない操作は却下される (`--yes` で全許可)。
 	Agent {
+		/// builtin では必須。antigravity で省略すると agy の既定モデル
 		#[arg(long)]
-		model: String,
+		model: Option<String>,
 		#[arg(long)]
 		prompt: String,
 		#[arg(long)]
@@ -104,6 +117,9 @@ enum Cmd {
 		/// 全ステップ合算の usage をstderrに表示
 		#[arg(long, default_value_t = false)]
 		show_usage: bool,
+		/// 外部エージェントの会話を続きから再開する (終了時に表示される session ID)
+		#[arg(long, value_name = "SESSION_ID")]
+		resume: Option<String>,
 	},
 }
 
@@ -120,15 +136,42 @@ fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) ->
 			}
 		}
 		"commandcode" => {
-			let client = CommandCodeProvider::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+			let client = CommandCodeProvider::from_env()?;
 			Ok(Arc::new(client))
 		}
 		"gemini" => {
-			let client = GeminiProvider::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+			let client = GeminiProvider::from_env()?;
 			Ok(Arc::new(client))
 		}
+		"antigravity" | "agy" => Err(anyhow::anyhow!(
+			"antigravity はモデルではなくエージェントです: `--backend antigravity agent ...` を使ってください"
+		)),
 		other => Err(anyhow::anyhow!("unknown provider: {other} (commandcode|gemini|mock)")),
 	}
+}
+
+/// 外部エージェントのファクトリ。`builtin` は `--provider` から組み立てるので `None`。
+fn make_external(backend: &str, workdir: Option<&std::path::Path>) -> anyhow::Result<Option<Arc<dyn AgentBackend>>> {
+	match backend {
+		"builtin" => Ok(None),
+		// Antigravity CLI (`agy`) をサブプロセスで使う。認証は agy 側。
+		"antigravity" | "agy" => {
+			let mut agent = AntigravityAgent::from_env();
+			if let Some(dir) = workdir {
+				agent = agent.with_workdir(dir);
+			}
+			Ok(Some(Arc::new(agent)))
+		}
+		other => Err(anyhow::anyhow!("unknown backend: {other} (builtin|antigravity)")),
+	}
+}
+
+/// `chat` / `quota` は Provider (モデル) 専用。
+fn ensure_builtin(backend: &str, command: &str) -> anyhow::Result<()> {
+	if backend == "builtin" {
+		return Ok(());
+	}
+	anyhow::bail!("`{command}` はモデル (--provider) 専用です。--backend は `agent` / `models` でのみ使えます")
 }
 
 fn main() -> anyhow::Result<()> {
@@ -144,12 +187,20 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-	let client = make_client(&cli.provider, &cli.mock_prefix, cli.mock_error)?;
+	// 外部エージェントだけ使うときに Provider の認証を要求しないよう、必要になるまで作らない。
+	let client = || make_client(&cli.provider, &cli.mock_prefix, cli.mock_error.clone());
 
 	match cli.cmd {
 		Cmd::Models { limit, json } => {
-			// `dyn LlmClient` に対して呼ぶ = どの実装でも同じコード
-			let models = client.list_models().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+			// `dyn Provider` / `dyn AgentBackend` に対して呼ぶ = どの実装でも同じコード
+			let (name, models) = match make_external(&cli.backend, None)? {
+				Some(agent) => (agent.name(), agent.list_models().await),
+				None => {
+					let client = client()?;
+					(client.name(), client.list_models().await)
+				}
+			};
+			let models = models?;
 
 			if json {
 				let out: Vec<_> = match limit {
@@ -160,7 +211,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 			} else {
 				let total = models.len();
 				let shown = limit.map(|l| total.min(l)).unwrap_or(total);
-				println!("[{}] {} models (showing {} of {})", client.name(), total, shown, total);
+				println!("[{name}] {total} models (showing {shown} of {total})");
 				for m in models.iter().take(shown) {
 					let eps = m
 						.supported_endpoints
@@ -187,8 +238,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 			json,
 			no_thinking,
 		} => {
+			ensure_builtin(&cli.backend, "chat")?;
 			run_chat(
-				&*client,
+				&*client()?,
 				model,
 				prompt,
 				system,
@@ -202,7 +254,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 			.await?;
 		}
 		Cmd::Quota { json } => {
-			run_quota(&*client, json).await?;
+			ensure_builtin(&cli.backend, "quota")?;
+			run_quota(&*client()?, json).await?;
 		}
 		Cmd::Agent {
 			model,
@@ -214,19 +267,31 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 			yes,
 			no_thinking,
 			show_usage,
+			resume,
 		} => {
+			let backend: Arc<dyn AgentBackend> = match make_external(&cli.backend, Some(&workdir))? {
+				Some(agent) => agent,
+				None => {
+					if model.is_none() {
+						anyhow::bail!("--backend builtin では --model が必要です");
+					}
+					let mut tools = llm::ToolRegistry::new();
+					tools.extend(letsharness_tool_builtin::builtin_tools(workdir));
+					Arc::new(llm::BuiltinAgent::new(client()?, tools))
+				}
+			};
 			agent::run(
-				client,
+				backend,
 				agent::Options {
-					model,
+					model: model.unwrap_or_default(),
 					prompt,
 					system,
 					max_tokens,
 					max_steps,
-					workdir,
 					yes,
 					no_thinking,
 					show_usage,
+					resume,
 				},
 			)
 			.await?;
@@ -277,8 +342,7 @@ async fn run_chat(
 	if wire == "messages" {
 		let out = client
 			.messages_with_usage(&model, msgs, system.as_deref(), max_tokens.unwrap_or(1024))
-			.await
-			.map_err(|e| anyhow::anyhow!("{e}"))?;
+			.await?;
 		emit_output(
 			out.text,
 			out.thinking,
@@ -290,10 +354,7 @@ async fn run_chat(
 		);
 	} else if wire == "responses" && !stream {
 		let input = msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
-		let out = client
-			.responses_with_usage(&model, &input)
-			.await
-			.map_err(|e| anyhow::anyhow!("{e}"))?;
+		let out = client.responses_with_usage(&model, &input).await?;
 		emit_output(
 			out.text,
 			out.thinking,
@@ -346,8 +407,7 @@ async fn run_chat(
 		};
 		let out = client
 			.chat_stream_with_usage(&model, msgs, &mut on_delta, &mut on_thinking)
-			.await
-			.map_err(|e| anyhow::anyhow!("{e}"))?;
+			.await?;
 		let header_printed = thinking_open.load(Ordering::SeqCst);
 		let closed = thinking_closed.load(Ordering::SeqCst);
 		if header_printed && !closed && !json_output && !no_thinking {
@@ -372,10 +432,7 @@ async fn run_chat(
 			no_thinking,
 		);
 	} else {
-		let out = client
-			.chat_with_usage(&model, msgs, max_tokens)
-			.await
-			.map_err(|e| anyhow::anyhow!("{e}"))?;
+		let out = client.chat_with_usage(&model, msgs, max_tokens).await?;
 		emit_output(
 			out.text,
 			out.thinking,

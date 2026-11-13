@@ -2,46 +2,53 @@
 //!
 //! 途中経過 (ツール呼び出し・結果・承認の確認) はすべて stderr、最終回答だけが stdout。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use letsharness_kernel::{self as llm, ChatMessage, Provider};
-use letsharness_tool_builtin::builtin_tools;
+use letsharness_kernel::{self as llm, AgentBackend, ChatMessage};
 
 use crate::format_usage;
 
 pub struct Options {
+	/// 空ならバックエンドの既定モデル。
 	pub model: String,
 	pub prompt: String,
 	pub system: Option<String>,
 	pub max_tokens: Option<u32>,
 	pub max_steps: usize,
-	pub workdir: PathBuf,
 	/// 承認が必要なツールを確認なしで実行する。
 	pub yes: bool,
 	pub no_thinking: bool,
 	pub show_usage: bool,
+	/// 外部エージェントの会話 ID。
+	pub resume: Option<String>,
 }
 
-pub async fn run(client: Arc<dyn Provider>, opts: Options) -> anyhow::Result<()> {
+pub async fn run(backend: Arc<dyn AgentBackend>, opts: Options) -> anyhow::Result<()> {
 	let mut messages = Vec::new();
 	if let Some(s) = opts.system {
 		messages.push(ChatMessage::system(s));
 	}
 	messages.push(ChatMessage::user(opts.prompt));
-	let mut tools = llm::ToolRegistry::new();
-	tools.extend(builtin_tools(opts.workdir));
 	let mut req = llm::AgentRequest::new(opts.model, messages);
 	req.max_tokens = opts.max_tokens;
 	req.max_steps = opts.max_steps;
+	req.session_id = opts.resume;
+	req.approval = if opts.yes {
+		llm::ApprovalPolicy::AutoApprove
+	} else {
+		llm::ApprovalPolicy::Ask
+	};
+	if !backend.asks_approval() && !opts.yes {
+		eprintln!(
+			"(注: {name} はツール実行の承認をこちらに求めません。{name} 側の権限設定で許可されていない操作は却下されます。全許可は --yes)",
+			name = backend.name()
+		);
+	}
 	let mut handler = CliHandler {
-		yes: opts.yes,
 		no_thinking: opts.no_thinking,
 	};
 
-	let out = llm::run_agent(&*client, &tools, &mut handler, req)
-		.await
-		.map_err(|e| anyhow::anyhow!("{e}"))?;
+	let out = backend.run(req, &mut handler).await?;
 	// 最終回答だけを stdout へ (途中経過は stderr なのでパイプ可能)。
 	println!("{}", out.text);
 	if opts.show_usage {
@@ -49,6 +56,9 @@ pub async fn run(client: Arc<dyn Provider>, opts: Options) -> anyhow::Result<()>
 			Some(u) => eprintln!("{} steps={}", format_usage(u), out.steps),
 			None => eprintln!("usage: (none) steps={}", out.steps),
 		}
+	}
+	if let Some(id) = &out.session_id {
+		eprintln!("session: {id} (--resume {id} で続きから)");
 	}
 	if out.hit_step_limit {
 		anyhow::bail!(
@@ -61,7 +71,6 @@ pub async fn run(client: Arc<dyn Provider>, opts: Options) -> anyhow::Result<()>
 
 /// 表示・承認を担う Handler。
 struct CliHandler {
-	yes: bool,
 	no_thinking: bool,
 }
 
@@ -131,10 +140,8 @@ impl llm::AgentHandler for CliHandler {
 		eprintln!("  {mark}\n{}", format_result(&output.content));
 	}
 
+	// `--yes` は ApprovalPolicy::AutoApprove になり、ここは呼ばれない。
 	async fn approve(&mut self, call: &llm::ToolCall, _spec: &llm::ToolSpec) -> bool {
-		if self.yes {
-			return true;
-		}
 		eprint!("  {} を実行する? [y/N] ", call.name);
 		// stdin はブロッキングなので別スレッドで待つ。EOF (非対話) は拒否扱い。
 		tokio::task::spawn_blocking(|| {

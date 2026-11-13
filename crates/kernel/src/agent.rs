@@ -1,8 +1,15 @@
-//! エージェントループ: モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答まで繰り返す。
+//! エージェント実行の拡張点とループ本体。
+//!
+//! - [`AgentBackend`] : 「依頼を受けて最終回答まで自走する」もの。ループを誰が回すかで実装が分かれる。
+//!   - [`BuiltinAgent`] : [`Provider`] (モデル) + [`ToolRegistry`] で、ループを LetsHarness が回す。
+//!   - 外部エージェント (Antigravity CLI など) : ループもツールも相手が持つ。
+//! - [`run_agent`] : 組み込みループ (モデル呼び出し → ツール実行 → 結果を返して再呼び出し)。
 //!
 //! kernel は UI を知らないため、表示・承認は [`AgentHandler`] 経由で Frontend に委ねる。
 
-use crate::{ChatMessage, Error, Provider, Result, ToolCall, ToolOutput, ToolRegistry, ToolSpec, Usage};
+use std::sync::Arc;
+
+use crate::{ChatMessage, Error, ModelInfo, Provider, Result, ToolCall, ToolOutput, ToolRegistry, ToolSpec, Usage};
 
 /// 1回の `run_agent` でモデルを呼ぶ回数の既定上限 (暴走防止)。
 pub const DEFAULT_MAX_STEPS: usize = 20;
@@ -27,12 +34,30 @@ pub trait AgentHandler: Send {
 	}
 }
 
+/// 承認が必要なツール (`ToolSpec::requires_approval`) の扱い。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+	/// 実行ごとに [`AgentHandler::approve`] で確認する。
+	///
+	/// 確認の口を持たない外部エージェント ([`AgentBackend::asks_approval`] が `false`) では、
+	/// エージェント側の設定で事前に許可されていないものは却下される。
+	#[default]
+	Ask,
+	/// 確認なしで全て実行する。
+	AutoApprove,
+}
+
 pub struct AgentRequest {
+	/// 空ならバックエンドの既定モデル (対応していれば)。
 	pub model: String,
 	pub messages: Vec<ChatMessage>,
 	pub max_tokens: Option<u32>,
-	/// モデル呼び出しの上限回数。
+	/// モデル呼び出しの上限回数。外部エージェントでは効かないことがある。
 	pub max_steps: usize,
+	pub approval: ApprovalPolicy,
+	/// 外部エージェントが持つ会話を再開する ID ([`AgentOutcome::session_id`])。
+	/// 指定時、相手は履歴を持っているので `messages` は最後の依頼だけが使われる。
+	pub session_id: Option<String>,
 }
 
 impl AgentRequest {
@@ -42,6 +67,8 @@ impl AgentRequest {
 			messages,
 			max_tokens: None,
 			max_steps: DEFAULT_MAX_STEPS,
+			approval: ApprovalPolicy::default(),
+			session_id: None,
 		}
 	}
 }
@@ -52,13 +79,78 @@ pub struct AgentOutcome {
 	pub text: String,
 	/// 入力 + 途中のツール往復 + 最終回答を含む全履歴 (会話の継続に使える)。
 	pub messages: Vec<ChatMessage>,
-	/// モデルを呼んだ回数。
+	/// モデルを呼んだ回数 (外部エージェントでは観測できた範囲の推定値)。
 	pub steps: usize,
 	/// 全ステップ合算の使用量 (どのステップも usage を返さなければ `None`)。
 	pub usage: Option<Usage>,
 	/// `max_steps` に達して打ち切った (最終ターンがまだツールを要求していた)。
 	/// このとき `messages` は未実行のツール要求を含まない。
 	pub hit_step_limit: bool,
+	/// 外部エージェントの会話 ID。[`AgentRequest::session_id`] に渡すと続きから再開できる。
+	/// 組み込みループは `messages` で継続するため `None`。
+	pub session_id: Option<String>,
+}
+
+/// エージェント実行の拡張点。
+#[async_trait::async_trait]
+pub trait AgentBackend: Send + Sync {
+	/// 例: `"builtin"` / `"antigravity"`。
+	fn name(&self) -> &'static str;
+
+	/// ツール実行前に [`AgentHandler::approve`] を呼べるか。
+	/// `false` のバックエンドでは承認は [`ApprovalPolicy`] (起動時の権限) でしか制御できず、
+	/// ハンドラには実行の通知 (`on_tool_call` / `on_tool_result`) だけが届く。
+	fn asks_approval(&self) -> bool {
+		true
+	}
+
+	/// 使えるモデルの一覧。
+	async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+		Err(Error::Unsupported("list_models".into()))
+	}
+
+	async fn run(&self, req: AgentRequest, handler: &mut dyn AgentHandler) -> Result<AgentOutcome>;
+}
+
+/// [`Provider`] + [`ToolRegistry`] で [`run_agent`] を回す組み込みバックエンド。
+#[derive(Clone)]
+pub struct BuiltinAgent {
+	provider: Arc<dyn Provider>,
+	tools: ToolRegistry,
+}
+
+impl BuiltinAgent {
+	pub fn new(provider: Arc<dyn Provider>, tools: ToolRegistry) -> Self {
+		Self { provider, tools }
+	}
+
+	pub fn provider(&self) -> &Arc<dyn Provider> {
+		&self.provider
+	}
+
+	pub fn tools(&self) -> &ToolRegistry {
+		&self.tools
+	}
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for BuiltinAgent {
+	fn name(&self) -> &'static str {
+		"builtin"
+	}
+
+	async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+		self.provider.list_models().await
+	}
+
+	async fn run(&self, req: AgentRequest, handler: &mut dyn AgentHandler) -> Result<AgentOutcome> {
+		if req.session_id.is_some() {
+			return Err(Error::Unsupported(
+				"session_id (組み込みループは AgentOutcome::messages を渡して継続します)".into(),
+			));
+		}
+		run_agent(&*self.provider, &self.tools, handler, req).await
+	}
 }
 
 pub async fn run_agent(
@@ -72,6 +164,8 @@ pub async fn run_agent(
 		mut messages,
 		max_tokens,
 		max_steps,
+		approval,
+		session_id: _,
 	} = req;
 	if max_steps == 0 {
 		return Err(Error::Config("max_steps は 1 以上が必要です".into()));
@@ -98,6 +192,7 @@ pub async fn run_agent(
 				steps: step,
 				usage,
 				hit_step_limit: false,
+				session_id: None,
 			});
 		}
 		if !turn.text.is_empty() {
@@ -110,6 +205,7 @@ pub async fn run_agent(
 				steps: step,
 				usage,
 				hit_step_limit: true,
+				session_id: None,
 			});
 		}
 
@@ -124,7 +220,7 @@ pub async fn run_agent(
 			turn.tool_calls.clone(),
 		));
 		for call in &turn.tool_calls {
-			let output = execute(tools, handler, call).await;
+			let output = execute(tools, handler, call, approval).await;
 			handler.on_tool_result(call, &output);
 			messages.push(ChatMessage::tool_result(&call.id, tool_result_text(&output)));
 		}
@@ -132,12 +228,17 @@ pub async fn run_agent(
 	unreachable!("max_steps >= 1 のためループ内で必ず return する")
 }
 
-async fn execute(tools: &ToolRegistry, handler: &mut dyn AgentHandler, call: &ToolCall) -> ToolOutput {
+async fn execute(
+	tools: &ToolRegistry,
+	handler: &mut dyn AgentHandler,
+	call: &ToolCall,
+	approval: ApprovalPolicy,
+) -> ToolOutput {
 	handler.on_tool_call(call);
 	let Some((spec, tool)) = tools.get(&call.name) else {
 		return ToolOutput::error(format!("unknown tool: {}", call.name));
 	};
-	if spec.requires_approval && !handler.approve(call, spec).await {
+	if spec.requires_approval && approval == ApprovalPolicy::Ask && !handler.approve(call, spec).await {
 		return ToolOutput::error("denied: ユーザーがこのツール実行を許可しませんでした");
 	}
 	tool.call(call.arguments.clone()).await
@@ -374,6 +475,39 @@ mod tests {
 		};
 		run_agent(&p, &registry(&runs), &mut h, req()).await.unwrap();
 		assert_eq!(*runs.lock().unwrap(), 1);
+	}
+
+	#[tokio::test]
+	async fn auto_approve_skips_handler() {
+		let runs = Arc::new(Mutex::new(0));
+		let p = Scripted::new(vec![turn("", vec![call("c1", "danger")]), turn("ok", vec![])]);
+		let mut h = Rec::default(); // allow = false でも聞かれない
+		let mut r = req();
+		r.approval = ApprovalPolicy::AutoApprove;
+		run_agent(&p, &registry(&runs), &mut h, r).await.unwrap();
+		assert_eq!(*runs.lock().unwrap(), 1);
+	}
+
+	#[tokio::test]
+	async fn builtin_backend_wraps_run_agent() {
+		let runs = Arc::new(Mutex::new(0));
+		let backend: Arc<dyn AgentBackend> = Arc::new(BuiltinAgent::new(
+			Arc::new(Scripted::new(vec![
+				turn("", vec![call("c1", "echo")]),
+				turn("ok", vec![]),
+			])),
+			registry(&runs),
+		));
+		assert_eq!(backend.name(), "builtin");
+		assert!(backend.asks_approval());
+		let out = backend.run(req(), &mut Rec::default()).await.unwrap();
+		assert_eq!((out.text.as_str(), out.steps), ("ok", 2));
+		assert_eq!(out.session_id, None);
+
+		let mut r = req();
+		r.session_id = Some("s".into());
+		let err = backend.run(r, &mut Rec::default()).await;
+		assert!(matches!(err, Err(Error::Unsupported(_))));
 	}
 
 	#[tokio::test]

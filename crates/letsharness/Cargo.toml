@@ -11,6 +11,7 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+letsharness-agent-antigravity.workspace = true
 letsharness-kernel.workspace = true
 letsharness-plugin-dotenv.workspace = true
 letsharness-provider-commandcode.workspace = true
