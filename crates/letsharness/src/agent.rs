@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use anyhow::{Result, bail};
 use letsharness_kernel::{self as llm, AgentBackend, ChatMessage};
 
 use crate::format_usage;
@@ -23,7 +24,7 @@ pub struct Options {
 	pub resume: Option<String>,
 }
 
-pub async fn run(backend: Arc<dyn AgentBackend>, opts: Options) -> anyhow::Result<()> {
+pub async fn run(backend: Arc<dyn AgentBackend>, opts: Options) -> Result<()> {
 	let mut messages = Vec::new();
 	if let Some(s) = opts.system {
 		messages.push(ChatMessage::system(s));
@@ -61,7 +62,7 @@ pub async fn run(backend: Arc<dyn AgentBackend>, opts: Options) -> anyhow::Resul
 		eprintln!("session: {id} (--resume {id} で続きから)");
 	}
 	if out.hit_step_limit {
-		anyhow::bail!(
+		bail!(
 			"--max-steps={} に達したため打ち切りました (タスクは未完了の可能性があります)",
 			opts.max_steps
 		);

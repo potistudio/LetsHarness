@@ -2,6 +2,7 @@ mod agent;
 
 use std::sync::Arc;
 
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 
 use letsharness_agent_antigravity::AntigravityAgent;
@@ -124,7 +125,7 @@ enum Cmd {
 }
 
 /// トレイト経由のファクトリ。ここを差し替えるだけで実装が切り替わる。
-fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) -> anyhow::Result<Arc<dyn Provider>> {
+fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) -> Result<Arc<dyn Provider>> {
 	match provider {
 		"mock" => {
 			if let Some(msg) = mock_error {
@@ -143,15 +144,15 @@ fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) ->
 			let client = GeminiProvider::from_env()?;
 			Ok(Arc::new(client))
 		}
-		"antigravity" | "agy" => Err(anyhow::anyhow!(
+		"antigravity" | "agy" => Err(anyhow!(
 			"antigravity はモデルではなくエージェントです: `--backend antigravity agent ...` を使ってください"
 		)),
-		other => Err(anyhow::anyhow!("unknown provider: {other} (commandcode|gemini|mock)")),
+		other => Err(anyhow!("unknown provider: {other} (commandcode|gemini|mock)")),
 	}
 }
 
 /// 外部エージェントのファクトリ。`builtin` は `--provider` から組み立てるので `None`。
-fn make_external(backend: &str, workdir: Option<&std::path::Path>) -> anyhow::Result<Option<Arc<dyn AgentBackend>>> {
+fn make_external(backend: &str, workdir: Option<&std::path::Path>) -> Result<Option<Arc<dyn AgentBackend>>> {
 	match backend {
 		"builtin" => Ok(None),
 		// Antigravity CLI (`agy`) をサブプロセスで使う。認証は agy 側。
@@ -162,19 +163,19 @@ fn make_external(backend: &str, workdir: Option<&std::path::Path>) -> anyhow::Re
 			}
 			Ok(Some(Arc::new(agent)))
 		}
-		other => Err(anyhow::anyhow!("unknown backend: {other} (builtin|antigravity)")),
+		other => Err(anyhow!("unknown backend: {other} (builtin|antigravity)")),
 	}
 }
 
 /// `chat` / `quota` は Provider (モデル) 専用。
-fn ensure_builtin(backend: &str, command: &str) -> anyhow::Result<()> {
+fn ensure_builtin(backend: &str, command: &str) -> Result<()> {
 	if backend == "builtin" {
 		return Ok(());
 	}
-	anyhow::bail!("`{command}` はモデル (--provider) 専用です。--backend は `agent` / `models` でのみ使えます")
+	bail!("`{command}` はモデル (--provider) 専用です。--backend は `agent` / `models` でのみ使えます")
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
 	let cli = Cli::parse();
 	if !cli.no_env_file {
 		// SAFETY: tokio ランタイム起動前で、環境変数に触るスレッドは main のみ。
@@ -186,7 +187,7 @@ fn main() -> anyhow::Result<()> {
 		.block_on(run(cli))
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli) -> Result<()> {
 	// 外部エージェントだけ使うときに Provider の認証を要求しないよう、必要になるまで作らない。
 	let client = || make_client(&cli.provider, &cli.mock_prefix, cli.mock_error.clone());
 
@@ -273,7 +274,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 				Some(agent) => agent,
 				None => {
 					if model.is_none() {
-						anyhow::bail!("--backend builtin では --model が必要です");
+						bail!("--backend builtin では --model が必要です");
 					}
 					let mut tools = llm::ToolRegistry::new();
 					tools.extend(letsharness_tool_builtin::builtin_tools(workdir));
@@ -314,7 +315,7 @@ async fn run_chat(
 	show_usage: bool,
 	json_output: bool,
 	no_thinking: bool,
-) -> anyhow::Result<()> {
+) -> Result<()> {
 	use std::io::Write;
 
 	let mut msgs: Vec<ChatMessage> = Vec::new();
@@ -518,7 +519,7 @@ fn format_usage(u: &llm::Usage) -> String {
 }
 
 /// Calls `client.quota()` and prints the result in a human-readable format or JSON.
-async fn run_quota(client: &dyn Provider, json: bool) -> anyhow::Result<()> {
+async fn run_quota(client: &dyn Provider, json: bool) -> Result<()> {
 	let quota = client.quota().await?;
 
 	if json {
