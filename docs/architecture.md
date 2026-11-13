@@ -10,9 +10,9 @@ kernel は拡張点の受け口と実行基盤だけを持ち、CLI・プロバ�
 
 | Layer | 役割 | 依存してよいもの |
 | --- | --- | --- |
-| `bootstrap` (`main.rs`) | 同梱プラグインの列挙、`--config` / `--frontend` の抽出、Frontend の起動 | kernel, 各プラグイン |
-| `kernel` | `Registry` / `Host` / `Session` / `Config` と、汎用拡張点 trait | serde, futures (UI・HTTP ライブラリには依存しない) |
-| `frontend-*` | CLI / TUI / Server などのユーザー接点 | kernel (+ clap 等) |
+| `bootstrap` (`main.rs`) | 同梱プラグインを `Kernel` に渡すだけ。ロジックは持たない | kernel, 各プラグイン (Cargo 上でプラグインを名指しできるのはここだけ) |
+| `kernel` | `Kernel` (プラグインを束ねて起動) / `Registry` / `Host` / `Session` / `Config` と、汎用拡張点 trait | serde, futures (UI・HTTP ライブラリには依存しない) |
+| `frontend-*` | CLI / TUI / Server などのユーザー接点。Client もプラグイン | **kernel のみ** (+ clap 等)。Provider・Tool・Agent は `Host` に頼んで受け取る |
 | `provider-*` | 各社 API の実装 | kernel (+ reqwest 等) |
 | `agent-*` | 外部エージェント (CLI など) を `AgentBackend` として包む | kernel (+ tokio::process 等) |
 | `plugin-host` | 外部プラグインの発見・起動・Transport・MCP クライアント | kernel |
@@ -23,7 +23,7 @@ kernel は拡張点の受け口と実行基盤だけを持ち、CLI・プロバ�
 
 1. **main.rs はロジックを持たない。** どのプラグインを同梱するかを決めるだけの composition root（ディストリのマニフェスト）。将来は kernel をライブラリとして公開し、ユーザーが自分の `main.rs` で独自ハーネスを組めるようにする。
 2. **拡張点は kernel が決め打ちしない。** `Registry` は `TypeId` をキーにした汎用の入れ物で、拡張点の trait はそれを使うプラグインが定義してよい（例: `CliCommand` は `frontend-cli` が定義する）。
-3. **プラグイン同士は直接依存しない。** Client (Frontend) も広義のプラグインで、他のプラグインとは `Host` / `Registry` 越しにしか繋がらない。起動前の処理 (`.env` 読み込みなど) は `Plugin::early_init` に載せ、`BootArgs` で自分のフラグだけを抜き取る。Cargo の依存として `plugin-*` を持ってよいのは composition root (`main.rs`) だけ。
+3. **プラグインを使うのは kernel。** Client (Frontend) も広義のプラグインで、他のプラグインの crate には依存しない。`Kernel` が `Plugin::early_init` → `register` → Frontend 起動の順に扱い、Frontend は `Host` に `kind` 名で頼んで Provider / Tool / Agent を受け取る。起動前の処理 (`.env` 読み込みなど) は `early_init` で `BootArgs` から自分のフラグだけを抜き取る。Cargo の依存でプラグインを名指しするのは composition root (`main.rs`) だけで、そこは「どれを kernel に渡すか」を並べるだけ。
 4. **Frontend は Provider を直接呼ばない。** 必ず `Host` / `Session` を経由し、hook と tool がどの Frontend からでも同じように効くようにする。
 5. **モデルとエージェントを分ける。** 分ける軸は認証方式 (APIキー / CLI のログイン) ではなく「エージェントループを誰が回すか」。1回の呼び出しがモデル1回で、ツール・履歴をこちらが持つものは `Provider`。ループ・ツール・会話履歴を相手が持つもの (Antigravity CLI など) は `AgentBackend`。CLI の保存済み認証情報で API を直接叩くなら、それは `Provider`。
 6. **Provider の `chat` は1本。** wire（chat/completions, responses, messages）の選択は各 Provider の内部事情。戻り値は `BoxStream<ChatEvent>` で、非ストリームは collect するだけ。
@@ -35,8 +35,10 @@ kernel は拡張点の受け口と実行基盤だけを持ち、CLI・プロバ�
 | 拡張点 | 定義場所 | 用途 |
 | --- | --- | --- |
 | `Plugin` | kernel | すべてのプラグインの入口。`register(&mut Registry)` で各拡張点に登録する。ランタイム起動前に同期で走る `early_init(&mut BootArgs)` も持つ (実装済み。`register` は Registry と同時に導入) |
-| `Frontend` | kernel | CLI / TUI / Server。`run(host, args) -> ExitCode` |
-| `ProviderFactory` → `Provider` | kernel | LLM API。`create(cfg: Value)` でインスタンス化 |
+| `Frontend` | kernel | CLI / TUI / Server。`run(host, args) -> ExitCode`。`--frontend <name>` で選び、省略時は最初に登録されたもの |
+| `ProviderFactory` → `Provider` | kernel | LLM API。`create(cfg: Value)` でインスタンス化。`Host::provider(kind, cfg)` |
+| `AgentBackendFactory` → `AgentBackend` | kernel | 外部エージェント。`Host::agent_backend(kind, cfg)` |
+| `ToolFactory` → `Tool` | kernel | ツールの供給元。`Host::tools(cfg)` が全部集める |
 | `AgentBackend` | kernel | 依頼を受けて最終回答まで自走するもの。`BuiltinAgent` (`Provider` + `ToolRegistry` で `run_agent` を回す) と外部エージェント (`agent-*`)。外部はツールを自分で実行するため `approve` は呼ばず、承認は `ApprovalPolicy` (起動時の権限) で制御する |
 | `Tool` | kernel | エージェントが呼ぶツール。スキーマは MCP と同形 |
 | `Hook` | kernel | before_request / on_tool_call / after_response などで介入・拒否 |
@@ -83,11 +85,11 @@ path = "~/.letsharness/plugins/openai-compat"
 ## Roadmap
 
 1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。`ProviderFactory` と設定ファイルを導入して `make_client` を廃止する。
-2. kernel（`Host` / 型付き `Registry`）を切り出し、現在の CLI を `frontend-cli` プラグインへ移す（挙動は変えない）。
+2. kernel（`Kernel` / `Host` / 型付き `Registry`）を切り出し、現在の CLI を `frontend-cli` プラグインへ移す。**実装済み** (`ProviderFactory` / `AgentBackendFactory` / `ToolFactory` / `Frontend`)。プロバイダ固有の設定は `-o key=value` (例: mock の `prefix` / `error`)。`Session` / `Hook` / 設定ファイルは未着手。
 3. `CliCommand` 拡張点と、PATH 上の外部コマンドへのフォールバック。
 4. `Tool` / `Hook` / エージェントループと MCP クライアント。`Tool` / `ToolRegistry` / `run_agent` (kernel)、`Provider::chat_with_tools`、同梱ツール (`crates/tool-builtin`)、`letsharness agent`、`AgentBackend` / `BuiltinAgent` と外部エージェント `crates/agent-antigravity` (`--backend antigravity`) は実装済み。`Hook` と MCP クライアントは未着手。
 5. 外部プラグイン（manifest + stdio JSON-RPC）。
-6. Cargo workspace への分割（`kernel` / `frontend-cli` / `provider-*` / `plugin-host` / bin）。`crates/kernel` / `crates/agent-antigravity` / `crates/provider-commandcode` / `crates/provider-gemini` / `crates/provider-mock` / `crates/letsharness` (bin) は分割済み。`frontend-cli` と `plugin-host` は Step 2・5 で作る。
+6. Cargo workspace への分割（`kernel` / `frontend-cli` / `provider-*` / `plugin-host` / bin）。`crates/kernel` / `crates/agent-antigravity` / `crates/provider-commandcode` / `crates/provider-gemini` / `crates/provider-mock` / `crates/letsharness` (bin) は分割済み。`crates/frontend-cli` も分割済み。`plugin-host` は Step 5 で作る。
 7. 必要になったら TUI / Server frontend、C ABI / WASM transport。
 
 ## Diagrams

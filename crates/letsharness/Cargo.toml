@@ -10,16 +10,14 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+# このバイナリは「どのプラグインを同梱するか」を並べるだけ (composition root)。
+# プラグイン同士は互いに依存せず、使うのは kernel。
 [dependencies]
-letsharness-agent-antigravity.workspace = true
 letsharness-kernel.workspace = true
+letsharness-agent-antigravity.workspace = true
+letsharness-frontend-cli.workspace = true
 letsharness-plugin-dotenv.workspace = true
 letsharness-provider-commandcode.workspace = true
 letsharness-provider-gemini.workspace = true
 letsharness-provider-mock.workspace = true
 letsharness-tool-builtin.workspace = true
-tokio.workspace = true
-serde_json.workspace = true
-anyhow.workspace = true
-clap.workspace = true
-async-trait.workspace = true

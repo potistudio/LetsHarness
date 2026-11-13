@@ -9,12 +9,16 @@
 use serde::{Deserialize, Serialize};
 
 mod agent;
+mod host;
+mod kernel;
 mod plugin;
 mod tool;
 
 pub use agent::{
 	AgentBackend, AgentHandler, AgentOutcome, AgentRequest, ApprovalPolicy, BuiltinAgent, DEFAULT_MAX_STEPS, run_agent,
 };
+pub use host::{AgentBackendFactory, Frontend, Host, ProviderFactory, Registry, ToolFactory};
+pub use kernel::Kernel;
 pub use plugin::{BootArgs, Plugin, run_early_init};
 pub use tool::{Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 

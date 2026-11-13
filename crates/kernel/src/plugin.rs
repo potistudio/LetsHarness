@@ -7,11 +7,11 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::{Error, Result};
+use crate::{Error, Registry, Result};
 
 /// すべてのプラグインの入口。
 pub trait Plugin: Send + Sync {
-	/// 識別用の名前 (エラーメッセージに使う)。
+	/// Name of the plugin.
 	fn name(&self) -> &'static str;
 
 	/// ランタイム起動前に一度だけ呼ばれる。自分のフラグを `args` から抜き取って処理する。
@@ -19,6 +19,16 @@ pub trait Plugin: Send + Sync {
 	/// [`run_early_init`] 経由で呼ばれる間は、他のスレッドが存在しない
 	/// (= 環境変数を安全に書き換えられる) ことが保証される。
 	fn early_init(&self, _args: &mut BootArgs) -> Result<()> {
+		Ok(())
+	}
+
+	/// `early_init` が抜き取るフラグの説明。Frontend の `--help` に添えられる。
+	fn boot_help(&self) -> &'static str {
+		""
+	}
+
+	/// 拡張点 (Provider / Tool / Frontend ...) を `registry` に登録する。
+	fn register(&self, _registry: &mut Registry) -> Result<()> {
 		Ok(())
 	}
 }
@@ -34,6 +44,7 @@ pub unsafe fn run_early_init(plugins: &[Box<dyn Plugin>], args: &mut BootArgs) -
 	for plugin in plugins {
 		plugin.early_init(args)?;
 	}
+
 	Ok(())
 }
 

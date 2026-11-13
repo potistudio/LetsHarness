@@ -7,6 +7,10 @@
 //! - **`bash` はサンドボックスではない。** `root` の制限は cwd を決めるだけで、
 //!   実行されるコマンドは何でもできる。守りは承認だけ。
 
+mod plugin;
+
+pub use plugin::BuiltinToolsPlugin;
+
 mod bash;
 mod common;
 mod edit_file;

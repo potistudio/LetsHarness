@@ -15,6 +15,10 @@
 //! ツール呼び出しの `thoughtSignature` は [`ToolCall::extra`](letsharness_kernel::ToolCall)
 //! に保持して次ターンで送り返す (Gemini 3 は欠けると 400)。
 
+mod plugin;
+
+pub use plugin::GeminiPlugin;
+
 mod wire;
 
 use futures_util::StreamExt;

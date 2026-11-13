@@ -20,6 +20,10 @@
 //! - 月次capはAPIが返さない。CLIと同じくプランIDから [`plan_monthly_credits`]
 //!   で引き、`max(cap, monthlyCredits)` を実効capとする。
 
+mod plugin;
+
+pub use plugin::CommandCodePlugin;
+
 mod tools;
 
 use futures_util::StreamExt;

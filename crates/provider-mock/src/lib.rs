@@ -3,6 +3,10 @@
 //! ネットワークに触れず [`Provider`] を満たすため、
 //! ハーネスのロジック (ルーティング・表示・ツールループ) のテストに使える。
 
+mod plugin;
+
+pub use plugin::MockPlugin;
+
 use letsharness_kernel::{
 	ChatMessage, ChatOutput, Completion, Error, ModelInfo, Provider, Quota, QuotaWindow, Result, ToolCall, ToolSpec,
 	Usage,

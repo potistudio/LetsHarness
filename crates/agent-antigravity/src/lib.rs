@@ -20,6 +20,10 @@
 //! - `max_tokens` / `max_steps` は指定できない (無視する)。
 //! - usage は agy が内部で行った全モデル呼び出しの合算。
 
+mod plugin;
+
+pub use plugin::AntigravityPlugin;
+
 mod events;
 
 use std::path::{Path, PathBuf};

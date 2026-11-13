@@ -28,6 +28,10 @@ impl Plugin for DotenvPlugin {
 		"dotenv"
 	}
 
+	fn boot_help(&self) -> &'static str {
+		"Plugin options (dotenv):\n  --env-file <PATH>  読み込む `.env` ファイル。省略時はカレントから親へ遡って探す (環境変数 > .env)\n  --no-env-file      `.env` を読み込まない"
+	}
+
 	fn early_init(&self, args: &mut BootArgs) -> letsharness_kernel::Result<()> {
 		let no_env_file = args.take_flag("--no-env-file");
 		let env_file = args.take_value("--env-file")?;

@@ -659,18 +659,14 @@ dependencies = [
 name = "letsharness"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
- "clap",
  "letsharness-agent-antigravity",
+ "letsharness-frontend-cli",
  "letsharness-kernel",
  "letsharness-plugin-dotenv",
  "letsharness-provider-commandcode",
  "letsharness-provider-gemini",
  "letsharness-provider-mock",
  "letsharness-tool-builtin",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -678,6 +674,18 @@ name = "letsharness-agent-antigravity"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "letsharness-kernel",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "letsharness-frontend-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
  "letsharness-kernel",
  "serde_json",
  "tokio",
@@ -732,6 +740,7 @@ dependencies = [
  "async-trait",
  "letsharness-kernel",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
