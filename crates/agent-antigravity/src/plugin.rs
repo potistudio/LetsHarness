@@ -2,22 +2,13 @@
 
 use std::sync::Arc;
 
-use letsharness_kernel::{AgentBackend, AgentBackendFactory, Plugin, Registry, Result};
+use letsharness_kernel::{AgentBackend, AgentBackendFactory, PluginServer, Result};
 use serde_json::Value;
 
 use crate::AntigravityAgent;
 
-pub struct AntigravityPlugin;
-
-impl Plugin for AntigravityPlugin {
-	fn name(&self) -> &'static str {
-		"agent-antigravity"
-	}
-
-	fn register(&self, registry: &mut Registry) -> Result<()> {
-		registry.add::<dyn AgentBackendFactory>(Arc::new(AntigravityFactory));
-		Ok(())
-	}
+pub fn server() -> PluginServer {
+	PluginServer::new().agent(AntigravityFactory)
 }
 
 struct AntigravityFactory;

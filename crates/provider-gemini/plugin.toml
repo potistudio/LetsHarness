@@ -1,0 +1,5 @@
+name = "gemini"
+command = "letsharness-provider-gemini"
+
+[contributes]
+provider = ["gemini"]

@@ -1,52 +1,47 @@
-//! `.env` ファイルを読み込んでプロセスの環境変数に流し込むプラグイン。
+//! `.env` ファイルを読み込み、Provider などに渡す環境変数を kernel に返すプラグイン。
 //!
-//! Provider は `COMMAND_CODE_API_KEY` / `GEMINI_API_KEY` などを環境変数から読むため、
-//! それより前 (ランタイム起動前) に [`load`] を呼ぶ。
+//! Provider は `COMMAND_CODE_API_KEY` / `GEMINI_API_KEY` などを環境変数から読む。
+//! このプラグインは kernel の `boot` で呼ばれ、読んだ値を返す。kernel がそれを
+//! 以降に起動するプラグインの環境に足す (kernel 自身の環境変数は書き換えない)。
 //!
+//! - オプション (`-o key=value`): `env_file=<PATH>` で読むファイルを指定 /
+//!   `no_env_file=true` で読み込まない。省略時はカレントから親へ遡って `.env` を探す。
 //! - 既に設定されている環境変数は上書きしない (`環境変数 > .env`)。
 //! - 対応する書式: `KEY=VALUE` / `export KEY=VALUE` / `#` コメント /
 //!   `"..."` (エスケープ `\n \r \t \" \\` と複数行) / `'...'` (リテラル、複数行) /
 //!   クォートなし値の行末コメント (`KEY=v # comment`)。
 //! - `${VAR}` の展開はしない。
-//!
-//! kernel の [`Plugin`] として `early_init` フェーズで動き、`--env-file <PATH>` /
-//! `--no-env-file` を起動引数から抜き取る (Frontend はこのプラグインを知らなくてよい)。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use letsharness_kernel::{BootArgs, Plugin};
+use letsharness_kernel::BootHook;
+use serde_json::Value;
 
 /// 既定のファイル名。
 pub const FILE_NAME: &str = ".env";
 
-/// `.env` を読み込む kernel プラグイン。
+/// `.env` を読み込む kernel プラグイン (`boot` フック)。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DotenvPlugin;
 
-impl Plugin for DotenvPlugin {
-	fn name(&self) -> &'static str {
-		"dotenv"
-	}
-
-	fn boot_help(&self) -> &'static str {
-		"Plugin options (dotenv):\n  --env-file <PATH>  読み込む `.env` ファイル。省略時はカレントから親へ遡って探す (環境変数 > .env)\n  --no-env-file      `.env` を読み込まない"
-	}
-
-	fn early_init(&self, args: &mut BootArgs) -> letsharness_kernel::Result<()> {
-		let no_env_file = args.take_flag("--no-env-file");
-		let env_file = args.take_value("--env-file")?;
-		if no_env_file {
+impl BootHook for DotenvPlugin {
+	fn boot(&self, options: &Value) -> letsharness_kernel::Result<HashMap<String, String>> {
+		let env_file = options.get("env_file").and_then(Value::as_str);
+		let disabled = options
+			.get("no_env_file")
+			.and_then(Value::as_str)
+			.is_some_and(|v| !matches!(v, "false" | "0"));
+		if disabled {
 			if env_file.is_some() {
 				return Err(letsharness_kernel::Error::Config(
-					"--env-file と --no-env-file は同時に指定できません".into(),
+					"env_file と no_env_file は同時に指定できません".into(),
 				));
 			}
-			return Ok(());
+			return Ok(HashMap::new());
 		}
-		// SAFETY: `early_init` は kernel の `run_early_init` 経由で、ランタイム起動前に呼ばれる (その Safety 契約)。
-		unsafe { load(env_file.as_deref().map(Path::new)) }
-			.map_err(|e| letsharness_kernel::Error::plugin(self.name(), e))?;
-		Ok(())
+		let loaded = load(env_file.map(Path::new)).map_err(|e| letsharness_kernel::Error::plugin("dotenv", e))?;
+		Ok(loaded.map(|l| l.env.into_iter().collect()).unwrap_or_default())
 	}
 }
 
@@ -79,8 +74,8 @@ pub struct ParseError {
 pub struct Loaded {
 	/// 読み込んだファイル。
 	pub path: PathBuf,
-	/// 環境変数に設定したキー。
-	pub applied: Vec<String>,
+	/// 渡すべき環境変数 (既に環境にあるキーは含まない)。
+	pub env: Vec<(String, String)>,
 	/// 既に環境変数があったため無視したキー。
 	pub skipped: Vec<String>,
 }
@@ -90,16 +85,11 @@ pub fn find(start: &Path) -> Option<PathBuf> {
 	start.ancestors().map(|dir| dir.join(FILE_NAME)).find(|p| p.is_file())
 }
 
-/// `.env` を読み込んで環境変数に設定する。
+/// `.env` を読み、環境にまだ無いものを返す。環境変数は書き換えない。
 ///
 /// - `path` が `Some` のときはそのファイルを読む (無ければエラー)。
 /// - `None` のときはカレントディレクトリから [`find`] で探し、見つからなければ `Ok(None)`。
-///
-/// # Safety
-///
-/// 内部で [`std::env::set_var`] を呼ぶ。他のスレッドが環境変数を読み書きしていない
-/// (= 非同期ランタイムやスレッドを起動する前の) 状態で呼ぶこと。
-pub unsafe fn load(path: Option<&Path>) -> Result<Option<Loaded>, Error> {
+pub fn load(path: Option<&Path>) -> Result<Option<Loaded>, Error> {
 	let path = match path {
 		Some(p) => p.to_path_buf(),
 		None => {
@@ -132,9 +122,7 @@ pub unsafe fn load(path: Option<&Path>) -> Result<Option<Loaded>, Error> {
 		if std::env::var_os(&key).is_some() {
 			loaded.skipped.push(key);
 		} else {
-			// SAFETY: 呼び出し側が単一スレッドであることを保証する (関数の Safety 参照)。
-			unsafe { std::env::set_var(&key, value) };
-			loaded.applied.push(key);
+			loaded.env.push((key, value));
 		}
 	}
 	Ok(Some(loaded))
@@ -254,22 +242,36 @@ fn strip_inline_comment(s: &str) -> &str {
 mod tests {
 	use super::*;
 
-	#[test]
-	fn plugin_consumes_its_flags_and_leaves_the_rest() {
-		let mut args = BootArgs::new(["prog", "--no-env-file", "chat", "--prompt", "hi"]);
-		DotenvPlugin.early_init(&mut args).unwrap();
-		let rest: Vec<_> = args
-			.into_args()
-			.into_iter()
-			.map(|a| a.to_string_lossy().into_owned())
-			.collect();
-		assert_eq!(rest, ["prog", "chat", "--prompt", "hi"]);
+	fn opts(items: &[(&str, &str)]) -> Value {
+		Value::Object(
+			items
+				.iter()
+				.map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+				.collect(),
+		)
 	}
 
 	#[test]
-	fn plugin_rejects_conflicting_flags() {
-		let mut args = BootArgs::new(["prog", "--env-file", "x.env", "--no-env-file"]);
-		let err = DotenvPlugin.early_init(&mut args).unwrap_err();
+	fn boot_returns_env_without_touching_the_process() {
+		let dir = std::env::temp_dir().join(format!("lh-dotenv-boot-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let file = dir.join(FILE_NAME);
+		std::fs::write(&file, "LH_DOTENV_BOOT_KEY=from_file\n").unwrap();
+
+		let env = DotenvPlugin
+			.boot(&opts(&[("env_file", file.to_str().unwrap())]))
+			.unwrap();
+		assert_eq!(env.get("LH_DOTENV_BOOT_KEY").map(String::as_str), Some("from_file"));
+		assert!(std::env::var_os("LH_DOTENV_BOOT_KEY").is_none());
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn boot_can_be_disabled_and_rejects_conflicts() {
+		assert!(DotenvPlugin.boot(&opts(&[("no_env_file", "true")])).unwrap().is_empty());
+		let err = DotenvPlugin
+			.boot(&opts(&[("env_file", "x.env"), ("no_env_file", "true")]))
+			.unwrap_err();
 		assert!(matches!(err, letsharness_kernel::Error::Config(_)));
 	}
 
@@ -349,30 +351,23 @@ E='x'
 	}
 
 	#[test]
-	fn load_does_not_override_existing() {
+	fn load_skips_variables_already_in_the_environment() {
 		let dir = std::env::temp_dir().join(format!("lh-dotenv-load-{}", std::process::id()));
 		std::fs::create_dir_all(&dir).unwrap();
 		let file = dir.join(FILE_NAME);
-		std::fs::write(
-			&file,
-			"LH_DOTENV_TEST_NEW=from_file\nLH_DOTENV_TEST_EXISTING=from_file\n",
-		)
-		.unwrap();
+		// PATH は必ず環境にある。
+		std::fs::write(&file, "LH_DOTENV_TEST_NEW=from_file\nPATH=from_file\n").unwrap();
 
-		// SAFETY: このテスト専用のキーのみを触る。
-		unsafe { std::env::set_var("LH_DOTENV_TEST_EXISTING", "from_env") };
-		let loaded = unsafe { load(Some(&file)) }.unwrap().unwrap();
+		let loaded = load(Some(&file)).unwrap().unwrap();
 
-		assert_eq!(loaded.applied, vec!["LH_DOTENV_TEST_NEW"]);
-		assert_eq!(loaded.skipped, vec!["LH_DOTENV_TEST_EXISTING"]);
-		assert_eq!(std::env::var("LH_DOTENV_TEST_NEW").unwrap(), "from_file");
-		assert_eq!(std::env::var("LH_DOTENV_TEST_EXISTING").unwrap(), "from_env");
+		assert_eq!(loaded.env, pairs(&[("LH_DOTENV_TEST_NEW", "from_file")]));
+		assert_eq!(loaded.skipped, vec!["PATH"]);
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
 	#[test]
 	fn load_missing_explicit_path_is_error() {
 		let missing = std::env::temp_dir().join("lh-dotenv-definitely-missing/.env");
-		assert!(matches!(unsafe { load(Some(&missing)) }, Err(Error::Io { .. })));
+		assert!(matches!(load(Some(&missing)), Err(Error::Io { .. })));
 	}
 }

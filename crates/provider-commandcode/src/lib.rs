@@ -22,7 +22,7 @@
 
 mod plugin;
 
-pub use plugin::CommandCodePlugin;
+pub use plugin::server;
 
 mod tools;
 

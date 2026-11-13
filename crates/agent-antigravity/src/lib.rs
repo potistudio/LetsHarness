@@ -22,7 +22,7 @@
 
 mod plugin;
 
-pub use plugin::AntigravityPlugin;
+pub use plugin::server;
 
 mod events;
 

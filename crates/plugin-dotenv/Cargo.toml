@@ -12,3 +12,5 @@ repository.workspace = true
 [dependencies]
 letsharness-kernel.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

@@ -2,22 +2,13 @@
 
 use std::sync::Arc;
 
-use letsharness_kernel::{Plugin, Provider, ProviderFactory, Registry, Result};
+use letsharness_kernel::{PluginServer, Provider, ProviderFactory, Result};
 use serde_json::Value;
 
 use crate::GeminiProvider;
 
-pub struct GeminiPlugin;
-
-impl Plugin for GeminiPlugin {
-	fn name(&self) -> &'static str {
-		"provider-gemini"
-	}
-
-	fn register(&self, registry: &mut Registry) -> Result<()> {
-		registry.add::<dyn ProviderFactory>(Arc::new(GeminiFactory));
-		Ok(())
-	}
+pub fn server() -> PluginServer {
+	PluginServer::new().provider(GeminiFactory)
 }
 
 struct GeminiFactory;

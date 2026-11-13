@@ -2,22 +2,13 @@
 
 use std::sync::Arc;
 
-use letsharness_kernel::{Plugin, Registry, Result, Tool, ToolFactory};
+use letsharness_kernel::{PluginServer, Result, Tool, ToolFactory};
 use serde_json::Value;
 
 use crate::builtin_tools;
 
-pub struct BuiltinToolsPlugin;
-
-impl Plugin for BuiltinToolsPlugin {
-	fn name(&self) -> &'static str {
-		"tool-builtin"
-	}
-
-	fn register(&self, registry: &mut Registry) -> Result<()> {
-		registry.add::<dyn ToolFactory>(Arc::new(BuiltinToolFactory));
-		Ok(())
-	}
+pub fn server() -> PluginServer {
+	PluginServer::new().tool(BuiltinToolFactory)
 }
 
 struct BuiltinToolFactory;

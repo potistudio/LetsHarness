@@ -1,0 +1,5 @@
+name = "antigravity"
+command = "letsharness-agent-antigravity"
+
+[contributes]
+agent = ["antigravity", "agy"]

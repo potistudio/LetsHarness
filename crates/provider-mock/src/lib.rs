@@ -5,7 +5,7 @@
 
 mod plugin;
 
-pub use plugin::MockPlugin;
+pub use plugin::server;
 
 use letsharness_kernel::{
 	ChatMessage, ChatOutput, Completion, Error, ModelInfo, Provider, Quota, QuotaWindow, Result, ToolCall, ToolSpec,

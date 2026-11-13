@@ -2,22 +2,13 @@
 
 use std::sync::Arc;
 
-use letsharness_kernel::{Plugin, Provider, ProviderFactory, Registry, Result};
+use letsharness_kernel::{PluginServer, Provider, ProviderFactory, Result};
 use serde_json::Value;
 
 use crate::CommandCodeProvider;
 
-pub struct CommandCodePlugin;
-
-impl Plugin for CommandCodePlugin {
-	fn name(&self) -> &'static str {
-		"provider-commandcode"
-	}
-
-	fn register(&self, registry: &mut Registry) -> Result<()> {
-		registry.add::<dyn ProviderFactory>(Arc::new(CommandCodeFactory));
-		Ok(())
-	}
+pub fn server() -> PluginServer {
+	PluginServer::new().provider(CommandCodeFactory)
 }
 
 struct CommandCodeFactory;

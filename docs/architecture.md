@@ -1,7 +1,8 @@
 # Architecture
 
 LetsHarness は「可能な限りすべてをプラグインにする」マイクロカーネル構成を取る。
-kernel は拡張点の受け口と実行基盤だけを持ち、CLI・プロバイダ・ツール・フックはすべてプラグインとして載る。
+kernel は「プラグインを発見して使う」ことだけを持ち、プロバイダ・ツール・エージェント・`.env` 読み込みなどはすべて別プロセスのプラグインとして載る。
+`letsharness` は Client で、kernel を動かして `Host` に頼むだけ。どのプラグインがあるかは Client も kernel の実装も知らず、実行時に発見される。
 
 - 全体図: [Diagrams / Plugin architecture](#plugin-architecture)
 - Provider 拡張点とデータ設計: [Diagrams / Provider](#provider)
@@ -10,21 +11,22 @@ kernel は拡張点の受け口と実行基盤だけを持ち、CLI・プロバ�
 
 | Layer | 役割 | 依存してよいもの |
 | --- | --- | --- |
-| `bootstrap` (`main.rs`) | 同梱プラグインを `Kernel` に渡すだけ。ロジックは持たない | kernel, 各プラグイン (Cargo 上でプラグインを名指しできるのはここだけ) |
-| `kernel` | `Kernel` (プラグインを束ねて起動) / `Registry` / `Host` / `Session` / `Config` と、汎用拡張点 trait | serde, futures (UI・HTTP ライブラリには依存しない) |
-| `frontend-*` | CLI / TUI / Server などのユーザー接点。Client もプラグイン | **kernel のみ** (+ clap 等)。Provider・Tool・Agent は `Host` に頼んで受け取る |
-| `provider-*` | 各社 API の実装 | kernel (+ reqwest 等) |
-| `agent-*` | 外部エージェント (CLI など) を `AgentBackend` として包む | kernel (+ tokio::process 等) |
-| `plugin-host` | 外部プラグインの発見・起動・Transport・MCP クライアント | kernel |
+| `kernel` | プラグインの発見・起動・通信 (`Kernel::boot` → `Host`)、共有型、拡張点 trait、プラグイン側の `PluginServer` | serde, tokio, toml (UI・HTTP ライブラリには依存しない) |
+| `letsharness` (Client) | CLI。`Kernel::boot` で kernel を動かし、`Host` に `kind` 名で頼む | **kernel のみ** (+ clap 等) |
+| `provider-*` | 各社 API の実装。`bin` + `plugin.toml` | kernel (+ reqwest 等) |
+| `agent-*` | 外部エージェント (CLI など) を `AgentBackend` として包む。`bin` + `plugin.toml` | kernel (+ tokio::process 等) |
+| `tool-*` | エージェントが呼ぶツール。`bin` + `plugin.toml` | kernel |
+| `plugin-*` | 起動時フックなど。`bin` + `plugin.toml` (例: `plugin-dotenv`) | kernel |
 
+プラグイン同士・Client からプラグインへの Cargo 依存は存在しない。つながるのは実行時の発見と JSON だけ。
 `kernel` が `reqwest` や `clap` に依存していないことを、分離が守られているかの目安にする。
 
 ## Principles
 
-1. **main.rs はロジックを持たない。** どのプラグインを同梱するかを決めるだけの composition root（ディストリのマニフェスト）。将来は kernel をライブラリとして公開し、ユーザーが自分の `main.rs` で独自ハーネスを組めるようにする。
-2. **拡張点は kernel が決め打ちしない。** `Registry` は `TypeId` をキーにした汎用の入れ物で、拡張点の trait はそれを使うプラグインが定義してよい（例: `CliCommand` は `frontend-cli` が定義する）。
-3. **プラグインを使うのは kernel。** Client (Frontend) も広義のプラグインで、他のプラグインの crate には依存しない。`Kernel` が `Plugin::early_init` → `register` → Frontend 起動の順に扱い、Frontend は `Host` に `kind` 名で頼んで Provider / Tool / Agent を受け取る。起動前の処理 (`.env` 読み込みなど) は `early_init` で `BootArgs` から自分のフラグだけを抜き取る。Cargo の依存でプラグインを名指しするのは composition root (`main.rs`) だけで、そこは「どれを kernel に渡すか」を並べるだけ。
-4. **Frontend は Provider を直接呼ばない。** 必ず `Host` / `Session` を経由し、hook と tool がどの Frontend からでも同じように効くようにする。
+1. **Client は kernel を動かすだけ。** プラグインの列挙もリンクもしない。`Kernel::boot(BootConfig)` が実行時にプラグインを発見し、Client は返ってきた `Host` を使う。kernel 単体でもプラグイン0個で起動する。
+2. **拡張点は kernel が決め打ちしない。** プラグインは manifest の `contributes` に文字列 ID (`provider` / `agent` / `tool` / `boot`) で宣言し、kernel はそれを `dyn Provider` / `dyn AgentBackend` / `dyn Tool` として見せる Adapter を持つ。新しい拡張点は新しい `contributes` キーとメッセージで足す。
+3. **プラグインを使うのは kernel。** Client も広義のプラグインと同じ立場で、`Host` 経由でしかプラグインに触れない。プラグイン同士も互いを知らない。起動前の処理 (`.env` など) は `boot` で環境変数を返す形にし、kernel 自身の環境は書き換えない。
+4. **Client は Provider を直接呼ばない。** 必ず `Host` (将来は `Session`) を経由し、hook と tool がどの Client からでも同じように効くようにする。
 5. **モデルとエージェントを分ける。** 分ける軸は認証方式 (APIキー / CLI のログイン) ではなく「エージェントループを誰が回すか」。1回の呼び出しがモデル1回で、ツール・履歴をこちらが持つものは `Provider`。ループ・ツール・会話履歴を相手が持つもの (Antigravity CLI など) は `AgentBackend`。CLI の保存済み認証情報で API を直接叩くなら、それは `Provider`。
 6. **Provider の `chat` は1本。** wire（chat/completions, responses, messages）の選択は各 Provider の内部事情。戻り値は `BoxStream<ChatEvent>` で、非ストリームは collect するだけ。
 7. **kernel の型はプロセス境界を越えられる形にする。** 独自拡張は `extra: serde_json::Value` のみとし、`as_any()` のような境界を越えないものは使わない。エラーは `Unsupported` / `Config` / `Api` / `Plugin { source }` に限定し、特定実装の型を持ち込まない。
@@ -32,27 +34,46 @@ kernel は拡張点の受け口と実行基盤だけを持ち、CLI・プロバ�
 
 ## Extension points
 
-| 拡張点 | 定義場所 | 用途 |
-| --- | --- | --- |
-| `Plugin` | kernel | すべてのプラグインの入口。`register(&mut Registry)` で各拡張点に登録する。ランタイム起動前に同期で走る `early_init(&mut BootArgs)` も持つ (実装済み。`register` は Registry と同時に導入) |
-| `Frontend` | kernel | CLI / TUI / Server。`run(host, args) -> ExitCode`。`--frontend <name>` で選び、省略時は最初に登録されたもの |
-| `ProviderFactory` → `Provider` | kernel | LLM API。`create(cfg: Value)` でインスタンス化。`Host::provider(kind, cfg)` |
-| `AgentBackendFactory` → `AgentBackend` | kernel | 外部エージェント。`Host::agent_backend(kind, cfg)` |
-| `ToolFactory` → `Tool` | kernel | ツールの供給元。`Host::tools(cfg)` が全部集める |
-| `AgentBackend` | kernel | 依頼を受けて最終回答まで自走するもの。`BuiltinAgent` (`Provider` + `ToolRegistry` で `run_agent` を回す) と外部エージェント (`agent-*`)。外部はツールを自分で実行するため `approve` は呼ばず、承認は `ApprovalPolicy` (起動時の権限) で制御する |
-| `Tool` | kernel | エージェントが呼ぶツール。スキーマは MCP と同形 |
-| `Hook` | kernel | before_request / on_tool_call / after_response などで介入・拒否 |
-| `CliCommand` | frontend-cli | CLI サブコマンド（clap の builder API） |
+プラグイン側は `PluginServer` に factory を登録して `serve()` するだけ。kernel 側は manifest を見て、使われたときに起動する。
 
-CLI で未知のサブコマンドが来た場合は、PATH 上の `letsharness-<name>` を実行する（git / cargo と同じ方式）。
+| 拡張点 | プラグインが実装する trait | Client から見える形 | 用途 |
+| --- | --- | --- | --- |
+| `provider` | `ProviderFactory` → `Provider` | `Host::provider(kind, cfg)` → `Arc<dyn Provider>` | LLM API。`create(cfg: Value)` でインスタンス化 |
+| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | 依頼を受けて最終回答まで自走する外部エージェント。途中経過と承認はプロセス間で往復する |
+| `tool` | `ToolFactory` → `Tool` | `Host::tools(cfg)` → `ToolRegistry` | エージェントが呼ぶツール。スキーマは MCP と同形 |
+| `boot` | `BootHook` | (Kernel が起動時に呼ぶ) | 返した環境変数が、以降に起動するプラグインの環境に足される |
+
+組み込みエージェント `BuiltinAgent` (`Provider` + `ToolRegistry` で `run_agent` を回す) は kernel 内で動き、Client が組み立てる。
+`Hook` と `CliCommand` は未実装。
+
+## Writing a plugin
+
+```toml
+# plugin.toml
+name = "mock"
+command = "letsharness-provider-mock"   # manifest のあるディレクトリ → kernel の実行ファイルと同じ場所 → PATH の順に探す
+
+[contributes]
+provider = ["mock"]
+```
+
+```rust
+#[tokio::main]
+async fn main() {
+	PluginServer::new().provider(MockFactory).serve().await;
+}
+```
+
+発見先 (`BootConfig::plugin_path`) は `$LETSHARNESS_PLUGIN_PATH` → 実行ファイル横の `plugins/` → `~/.letsharness/plugins`。各ディレクトリの直下 `*/plugin.toml` を読む。
+開発中は `.cargo/config.toml` が `LETSHARNESS_PLUGIN_PATH=crates` を設定するので、`cargo build --workspace` したあと `cargo run -p letsharness -- ...` でそのまま動く。
 
 ## Configuration
 
 優先順位は `デフォルト < 設定ファイル < 環境変数 < CLI (-o key=value)`。
 
-`.env` は `crates/plugin-dotenv` (`DotenvPlugin`) が `Plugin::early_init` でランタイム起動前に読み込み、未設定の環境変数だけを埋める（`.env < 環境変数`）。カレントから親へ遡って探し、`--env-file <PATH>` で指定、`--no-env-file` で無効化できる。
+`.env` は `crates/plugin-dotenv` が `boot` で読み、未設定の環境変数だけを返す（`.env < 環境変数`）。kernel はそれを以降に起動するプラグインの環境に足す。カレントから親へ遡って探し、`-o env_file=<PATH>` で指定、`-o no_env_file=true` で無効化できる。
 
-これらのフラグはプラグインが `BootArgs` から抜き取るため、Frontend (clap) は `.env` の存在を知らない。`--help` には Frontend 側の `after_help` で手書きしている。
+プラグイン固有の設定は専用フラグを持たず、`-o key=value` で渡す (`boot` を持つプラグインと、選択中のインスタンスに届く)。例: mock の `-o prefix=">> "` / `-o error=boom`。
 
 ```toml
 frontend = "cli"
@@ -74,23 +95,23 @@ path = "~/.letsharness/plugins/openai-compat"
 
 ## External plugins
 
-- 型付き拡張点はプロセス内でしか使えない。外部プラグインは manifest の `contributes` に文字列 ID（`provider` / `tool` / `hook` / `cli.command` …）で宣言し、`ExternalPluginAdapter` が `dyn T` に変換して `Registry` に登録する。
-- メッセージ定義（JSON Schema）を先に固定し、運ぶ手段（`Transport`）は差し替え可能にする。
-  - **stdio JSON-RPC**: 最初に実装する。言語非依存で、プラグインがクラッシュしてもホストは巻き込まれない。
-  - **C ABI (dylib)**: 高頻度呼び出しや C/C++/Zig 製プラグインが必要になったら。Provider / Tool / Hook はネットワークや I/O が支配的で IPC のオーバーヘッドは誤差のため、現時点では採用しない（async が境界を越えない、panic・メモリ破壊がホストに波及する、アンロード困難、OS×アーキごとの配布と署名が必要）。
-  - **WASM component model**: サンドボックスが必要になったら。
-- Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う。Provider には MCP 相当の標準がないため独自プロトコルとする。
-- Rust ABI での dylib 読み込みは行わない。
+- すべてのプラグインは別プロセス。Rust の ABI で dylib を読み込むことはしない。プラグインがクラッシュしても kernel は巻き込まれない。
+- 運ぶ手段は **stdio (1行1メッセージの JSON-RPC 風)**。メッセージは `crates/kernel/src/rpc.rs`。
+  - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。
+  - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。承認のようなプラグインから kernel への問い合わせも、同じ `req` を持つリクエスト。
+  - メソッド: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call`。
+- プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
+- 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
+- Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。
 
 ## Roadmap
 
-1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。`ProviderFactory` と設定ファイルを導入して `make_client` を廃止する。
-2. kernel（`Kernel` / `Host` / 型付き `Registry`）を切り出し、現在の CLI を `frontend-cli` プラグインへ移す。**実装済み** (`ProviderFactory` / `AgentBackendFactory` / `ToolFactory` / `Frontend`)。プロバイダ固有の設定は `-o key=value` (例: mock の `prefix` / `error`)。`Session` / `Hook` / 設定ファイルは未着手。
-3. `CliCommand` 拡張点と、PATH 上の外部コマンドへのフォールバック。
-4. `Tool` / `Hook` / エージェントループと MCP クライアント。`Tool` / `ToolRegistry` / `run_agent` (kernel)、`Provider::chat_with_tools`、同梱ツール (`crates/tool-builtin`)、`letsharness agent`、`AgentBackend` / `BuiltinAgent` と外部エージェント `crates/agent-antigravity` (`--backend antigravity`) は実装済み。`Hook` と MCP クライアントは未着手。
-5. 外部プラグイン（manifest + stdio JSON-RPC）。
-6. Cargo workspace への分割（`kernel` / `frontend-cli` / `provider-*` / `plugin-host` / bin）。`crates/kernel` / `crates/agent-antigravity` / `crates/provider-commandcode` / `crates/provider-gemini` / `crates/provider-mock` / `crates/letsharness` (bin) は分割済み。`crates/frontend-cli` も分割済み。`plugin-host` は Step 5 で作る。
-7. 必要になったら TUI / Server frontend、C ABI / WASM transport。
+1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。設定ファイル (`default_provider` / `[providers.x]`) を導入する。いまの `Provider` は多数のメソッドを持ち、そのまま線の上を流れている。
+2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
+3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response) を効かせる。
+4. MCP クライアント。`Tool` / `ToolRegistry` / `run_agent`、同梱ツール (`crates/tool-builtin`)、`AgentBackend` / `BuiltinAgent`、外部エージェント `crates/agent-antigravity` (`--backend antigravity`) は実装済み。
+5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。
+6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
 
 ## Diagrams
 
@@ -101,181 +122,125 @@ path = "~/.letsharness/plugins/openai-compat"
 title: LetsHarness - プラグインアーキテクチャ (マイクロカーネル)
 ---
 classDiagram
-  %% ---- bootstrap (main.rs = ディストリのマニフェスト) ----
-  namespace bootstrap {
-    class main {
-      +builtin() Vec~Box~Plugin~~
-      +main() ExitCode
-    }
-    class BootArgs {
-      +config: PathBuf
-      +frontend: String
-      +rest: Vec~OsString~
-      +scan(args) BootArgs
-    }
+  %% ---- Client: kernel にしか依存しない ----
+  class Client {
+    <<letsharness bin>>
+    +main()
   }
 
-  %% ---- kernel (UIを知らないライブラリ) ----
-  namespace kernel {
-    class Plugin {
-      <<interface>>
-      +id() str
-      +register(reg: Registry)
-    }
-    class Registry {
-      -points: TypeMap
-      +add(item: Arc~T~)
-      +all() Slice~Arc~T~~
-    }
-    class Host {
-      +builder() HostBuilder
-      +registry() Registry
-      +config() Config
-      +frontend(id: str) Arc~Frontend~
-      +provider(instance: str) Arc~Provider~
-      +session(instance: str) Session
-    }
-    class HostBuilder {
-      +config(cfg: Config)
-      +plugins(list: Vec~Box~Plugin~~)
-      +external_plugins_from_config()
-      +build() Arc~Host~
-    }
-    class Config {
-      +frontend: String
-      +default_provider: String
-      +providers: Map~Value~
-      +plugins: Vec~PluginRef~
-    }
-    class Session {
-      +send(req: ChatRequest) BoxStream~ChatEvent~
-    }
-    class Frontend {
-      <<interface>>
-      +id() str
-      +run(host: Arc~Host~, args: Vec~OsString~) ExitCode
-    }
-    class ProviderFactory {
-      <<interface>>
-      +kind() str
-      +create(cfg: Value) Arc~Provider~
-    }
-    class Tool {
-      <<interface>>
-      +spec() ToolSpec
-      +call(args: Value) ToolOutput
-    }
-    class Hook {
-      <<interface>>
-      +on(ev: HookEvent) HookDecision
-    }
+  %% ---- kernel ----
+  class Kernel {
+    +boot(BootConfig) Host
+  }
+  class BootConfig {
+    +options: Vec~(String, String)~
+    +plugin_path: Vec~PathBuf~
+  }
+  class Host {
+    +provider(kind, cfg) Arc~dyn Provider~
+    +agent_backend(kind, cfg) Arc~dyn AgentBackend~
+    +tools(cfg) ToolRegistry
+    +has_agent_backend(kind) bool
+  }
+  class Manifest {
+    +name
+    +command
+    +contributes
+  }
+  class Connection {
+    +start(method, params) Call
+    +call(method, params) Value
+  }
+  class PluginEntry {
+    <<lazy spawn>>
   }
 
-  %% ---- frontend-cli (プラグイン) ----
-  namespace frontend_cli {
-    class CliPlugin
-    class CliFrontend {
-      +id() "cli"
-    }
-    class CliCommand {
-      <<interface>>
-      +command() clap_Command
-      +run(host: Host, m: ArgMatches)
-    }
-    class ModelsCommand
-    class ChatCommand
-    class PluginsCommand
-    class ExternalCommand {
-      +exec(PATH上の letsharness-name)
-    }
+  %% ---- kernel が dyn Trait として見せる Adapter ----
+  class RemoteProvider
+  class RemoteAgent
+  class RemoteTool
+
+  class Provider {
+    <<interface>>
+  }
+  class AgentBackend {
+    <<interface>>
+  }
+  class Tool {
+    <<interface>>
   }
 
-  %% ---- 他の組み込みプラグイン ----
-  namespace builtin_plugins {
-    class CommandCodePlugin
-    class MockPlugin
-    class TuiPlugin
+  %% ---- プラグイン側 (別プロセス) ----
+  class PluginServer {
+    +provider(ProviderFactory)
+    +agent(AgentBackendFactory)
+    +tool(ToolFactory)
+    +boot_hook(BootHook)
+    +serve()
+  }
+  class ProviderFactory {
+    <<interface>>
+    +kind() str
+    +create(cfg) Provider
+  }
+  class AgentBackendFactory {
+    <<interface>>
+    +kind() str
+    +create(cfg) AgentBackend
+  }
+  class ToolFactory {
+    <<interface>>
+    +name() str
+    +create(cfg) Vec~Tool~
+  }
+  class BootHook {
+    <<interface>>
+    +boot(options) env
   }
 
-  %% ---- plugin-host (外部プラグイン / Phase 4) ----
-  namespace plugin_host {
-    class ExternalPluginAdapter {
-      -manifest: Manifest
-      -transport: Transport
-    }
-    class Manifest {
-      +id: String
-      +command: String
-      +protocol_version: u32
-      +contributes: Map~Vec~String~~
-    }
-    class Transport {
-      <<interface>>
-      +request(method: str, params: Value) Value
-      +notifications() BoxStream~Value~
-    }
-    class StdioJsonRpc
-    class CAbiTransport
-    class WasmTransport
-    class McpClient
-  }
+  %% ---- 同梱プラグイン (それぞれ bin + plugin.toml) ----
+  class ProviderCommandCode
+  class ProviderGemini
+  class ProviderMock
+  class AgentAntigravity
+  class ToolBuiltin
+  class PluginDotenv
 
-  %% --- bootstrap ---
-  main ..> BootArgs : scan
-  main ..> HostBuilder : build
-  main ..> Frontend : run(host, rest)
+  Client ..> Kernel : boot
+  Client ..> Host : 頼む
+  Kernel ..> BootConfig
+  Kernel ..> Manifest : 発見 (*/plugin.toml)
+  Kernel --> Host : 返す
+  Host o-- PluginEntry
+  PluginEntry *-- Manifest
+  PluginEntry ..> Connection : 初回に起動
+  Connection ..> PluginServer : stdio JSON-RPC
 
-  %% --- kernel ---
-  Plugin ..> Registry : register
-  HostBuilder ..> Host : build
-  Host *-- Registry
-  Host *-- Config
-  Host ..> Session : session
-  Session ..> ProviderFactory : 経由で生成したProvider
-  Session ..> Hook : 適用
-  Session ..> Tool : 実行
-  Registry o-- Frontend : dyn Frontend
-  Registry o-- ProviderFactory : dyn ProviderFactory
-  Registry o-- Tool : dyn Tool
-  Registry o-- Hook : dyn Hook
-  Registry o-- CliCommand : dyn CliCommand
+  Provider <|.. RemoteProvider
+  AgentBackend <|.. RemoteAgent
+  Tool <|.. RemoteTool
+  Host ..> RemoteProvider : create
+  Host ..> RemoteAgent : create
+  Host ..> RemoteTool : create
+  RemoteProvider ..> Connection
+  RemoteAgent ..> Connection
+  RemoteTool ..> Connection
 
-  %% --- frontend-cli ---
-  Plugin <|.. CliPlugin
-  CliPlugin ..> CliFrontend : add
-  CliPlugin ..> CliCommand : add 組み込みコマンド
-  Frontend <|.. CliFrontend
-  CliCommand <|.. ModelsCommand
-  CliCommand <|.. ChatCommand
-  CliCommand <|.. PluginsCommand
-  CliFrontend ..> CliCommand : all(dyn CliCommand)
-  CliFrontend ..> ExternalCommand : 未知のサブコマンド
-  CliCommand ..> Host : session / registry
+  PluginServer o-- ProviderFactory
+  PluginServer o-- AgentBackendFactory
+  PluginServer o-- ToolFactory
+  PluginServer o-- BootHook
+  ProviderFactory <|.. ProviderCommandCode
+  ProviderFactory <|.. ProviderGemini
+  ProviderFactory <|.. ProviderMock
+  AgentBackendFactory <|.. AgentAntigravity
+  ToolFactory <|.. ToolBuiltin
+  BootHook <|.. PluginDotenv
 
-  %% --- builtin ---
-  Plugin <|.. CommandCodePlugin
-  Plugin <|.. MockPlugin
-  Plugin <|.. TuiPlugin
-  CommandCodePlugin ..> ProviderFactory : add
-  MockPlugin ..> ProviderFactory : add
-  TuiPlugin ..> Frontend : add
-
-  %% --- plugin-host ---
-  Plugin <|.. ExternalPluginAdapter
-  ExternalPluginAdapter *-- Manifest
-  ExternalPluginAdapter o-- Transport
-  Transport <|.. StdioJsonRpc
-  Transport <|.. CAbiTransport
-  Transport <|.. WasmTransport
-  McpClient ..> Tool : MCPサーバーをdyn Toolに
-
-  note for main "ロジックを持たない composition root\nどのプラグインを同梱するかだけを決める\n(ユーザーが自分のmain.rsを書いて独自ハーネスを作れる)"
-  note for Registry "TypeIdをキーにした汎用の入れ物\n拡張点をkernelが決め打ちしない\n例: reg.add(dyn CliCommand)"
-  note for CliCommand "frontend-cli が定義する拡張点\nkernel は clap を知らない"
-  note for Frontend "Providerを直接呼ばず Host/Session 経由\n→ CLI/TUI/Serverで hook/tool が一貫して効く"
-  note for Transport "メッセージ定義(JSON Schema)は共通\n運ぶ手段だけ差し替え\n最初は stdio JSON-RPC。C ABI/WASM は必要時"
-  note for Manifest "型付き拡張点はプロセス内のみ\n外部は contributes の文字列ID\n(provider, tool, hook, cli.command …)\nを Adapter が dyn T に変換"
-  note for BootArgs "clapを使わず --config / --frontend だけ抜く\n残りはそのまま Frontend へ"
+  note for Client "kernel にしか依存しない\nプラグインの列挙もリンクもしない"
+  note for Kernel "プラグイン0個でも起動する\nboot で環境変数を集め、以降のプラグインの環境に足す\n(自分の環境変数は書き換えない)"
+  note for Connection "プラグインはクラッシュしても kernel を巻き込まない\nストリーム/エージェントの途中経過は params.req 付きの通知"
+  note for Manifest "contributes: provider / agent / tool / boot\n使われたときに初めて起動"
 ```
 
 ### Provider

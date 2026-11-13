@@ -1,6 +1,6 @@
 [package]
 name = "letsharness-kernel"
-description = "LetsHarness kernel: extension points and shared types. Must not depend on UI or HTTP libraries."
+description = "LetsHarness kernel: discovers and talks to plugins, and defines the shared types. Must not depend on UI or HTTP libraries."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,5 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true
+toml.workspace = true

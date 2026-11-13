@@ -17,7 +17,7 @@
 
 mod plugin;
 
-pub use plugin::GeminiPlugin;
+pub use plugin::server;
 
 mod wire;
 

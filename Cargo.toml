@@ -12,14 +12,7 @@ publish = false
 repository = "https://github.com/potistudio/LetsHarness"
 
 [workspace.dependencies]
-letsharness-agent-antigravity = { path = "crates/agent-antigravity" }
-letsharness-frontend-cli = { path = "crates/frontend-cli" }
 letsharness-kernel = { path = "crates/kernel" }
-letsharness-plugin-dotenv = { path = "crates/plugin-dotenv" }
-letsharness-provider-commandcode = { path = "crates/provider-commandcode" }
-letsharness-provider-gemini = { path = "crates/provider-gemini" }
-letsharness-provider-mock = { path = "crates/provider-mock" }
-letsharness-tool-builtin = { path = "crates/tool-builtin" }
 
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -27,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
 thiserror = "2"
+toml = "1"
 async-trait = "0.1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

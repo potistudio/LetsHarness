@@ -1,0 +1,5 @@
+name = "dotenv"
+command = "letsharness-plugin-dotenv"
+
+[contributes]
+boot = true

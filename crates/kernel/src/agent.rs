@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{ChatMessage, Error, ModelInfo, Provider, Result, ToolCall, ToolOutput, ToolRegistry, ToolSpec, Usage};
 
 /// 1回の `run_agent` でモデルを呼ぶ回数の既定上限 (暴走防止)。
@@ -35,7 +37,7 @@ pub trait AgentHandler: Send {
 }
 
 /// 承認が必要なツール (`ToolSpec::requires_approval`) の扱い。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalPolicy {
 	/// 実行ごとに [`AgentHandler::approve`] で確認する。
 	///
@@ -47,6 +49,7 @@ pub enum ApprovalPolicy {
 	AutoApprove,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
 	/// 空ならバックエンドの既定モデル (対応していれば)。
 	pub model: String,
@@ -73,7 +76,7 @@ impl AgentRequest {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentOutcome {
 	/// 最終ターンの本文。
 	pub text: String,

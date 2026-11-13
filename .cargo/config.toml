@@ -1,0 +1,4 @@
+# 開発中は `crates/*/plugin.toml` をそのままプラグインとして発見させる。
+# (配布時は `~/.letsharness/plugins` や実行ファイル横の `plugins/` を使う)
+[env]
+LETSHARNESS_PLUGIN_PATH = { value = "crates", relative = true }

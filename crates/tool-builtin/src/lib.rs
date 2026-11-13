@@ -9,7 +9,7 @@
 
 mod plugin;
 
-pub use plugin::BuiltinToolsPlugin;
+pub use plugin::server;
 
 mod bash;
 mod common;

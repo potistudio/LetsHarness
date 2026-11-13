@@ -1,0 +1,5 @@
+name = "commandcode"
+command = "letsharness-provider-commandcode"
+
+[contributes]
+provider = ["commandcode"]
