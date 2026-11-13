@@ -203,11 +203,7 @@ mod tests {
 	}
 
 	fn call(id: &str, name: &str) -> ToolCall {
-		ToolCall {
-			id: id.into(),
-			name: name.into(),
-			arguments: serde_json::json!({"x": 1}),
-		}
+		ToolCall::new(id, name, serde_json::json!({"x": 1}))
 	}
 
 	fn turn(text: &str, calls: Vec<ToolCall>) -> Completion {

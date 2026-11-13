@@ -14,6 +14,7 @@ repository = "https://github.com/potistudio/LetsHarness"
 [workspace.dependencies]
 letsharness-kernel = { path = "crates/kernel" }
 letsharness-provider-commandcode = { path = "crates/provider-commandcode" }
+letsharness-provider-gemini = { path = "crates/provider-gemini" }
 letsharness-provider-mock = { path = "crates/provider-mock" }
 letsharness-tool-builtin = { path = "crates/tool-builtin" }
 

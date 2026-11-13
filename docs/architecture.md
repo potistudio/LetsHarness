@@ -79,7 +79,7 @@ path = "~/.letsharness/plugins/openai-compat"
 3. `CliCommand` 拡張点と、PATH 上の外部コマンドへのフォールバック。
 4. `Tool` / `Hook` / エージェントループと MCP クライアント。`Tool` / `ToolRegistry` / `run_agent` (kernel)、`Provider::chat_with_tools`、同梱ツール (`crates/tool-builtin`)、`letsharness agent` は実装済み。`Hook` と MCP クライアントは未着手。
 5. 外部プラグイン（manifest + stdio JSON-RPC）。
-6. Cargo workspace への分割（`kernel` / `frontend-cli` / `provider-*` / `plugin-host` / bin）。`crates/kernel` / `crates/provider-commandcode` / `crates/provider-mock` / `crates/letsharness` (bin) は分割済み。`frontend-cli` と `plugin-host` は Step 2・5 で作る。
+6. Cargo workspace への分割（`kernel` / `frontend-cli` / `provider-*` / `plugin-host` / bin）。`crates/kernel` / `crates/provider-commandcode` / `crates/provider-gemini` / `crates/provider-mock` / `crates/letsharness` (bin) は分割済み。`frontend-cli` と `plugin-host` は Step 2・5 で作る。
 7. 必要になったら TUI / Server frontend、C ABI / WASM transport。
 
 ## Diagrams

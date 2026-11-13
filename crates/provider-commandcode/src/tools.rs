@@ -85,11 +85,11 @@ pub(crate) fn parse_chat_tools_response(v: &serde_json::Value) -> Completion {
 				.filter_map(|c| {
 					let name = c.pointer("/function/name")?.as_str()?.to_string();
 					let raw = c.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("");
-					Some(ToolCall {
-						id: c.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string(),
+					Some(ToolCall::new(
+						c.get("id").and_then(|i| i.as_str()).unwrap_or_default(),
 						name,
-						arguments: parse_tool_arguments(raw),
-					})
+						parse_tool_arguments(raw),
+					))
 				})
 				.collect()
 		})
@@ -186,11 +186,11 @@ pub(crate) fn parse_messages_tools_response(v: &serde_json::Value) -> Completion
 				let Some(name) = b.get("name").and_then(|n| n.as_str()) else {
 					continue;
 				};
-				tool_calls.push(ToolCall {
-					id: b.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string(),
-					name: name.to_string(),
-					arguments: b.get("input").cloned().unwrap_or_else(|| serde_json::json!({})),
-				});
+				tool_calls.push(ToolCall::new(
+					b.get("id").and_then(|i| i.as_str()).unwrap_or_default(),
+					name,
+					b.get("input").cloned().unwrap_or_else(|| serde_json::json!({})),
+				));
 			}
 			_ => {}
 		}
@@ -218,16 +218,8 @@ mod tests {
 
 	fn sample_history() -> Vec<ChatMessage> {
 		let calls = vec![
-			ToolCall {
-				id: "c1".into(),
-				name: "read_file".into(),
-				arguments: serde_json::json!({"path": "a"}),
-			},
-			ToolCall {
-				id: "c2".into(),
-				name: "read_file".into(),
-				arguments: serde_json::json!({"path": "b"}),
-			},
+			ToolCall::new("c1", "read_file", serde_json::json!({"path": "a"})),
+			ToolCall::new("c2", "read_file", serde_json::json!({"path": "b"})),
 		];
 		vec![
 			ChatMessage::system("sys"),

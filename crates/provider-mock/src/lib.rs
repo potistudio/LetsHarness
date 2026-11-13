@@ -226,11 +226,7 @@ impl Provider for MockClient {
 			};
 			return Ok(Completion {
 				text: format!("{}calling {name}", self.echo_prefix),
-				tool_calls: vec![ToolCall {
-					id: format!("mock_call_{}", messages.len()),
-					name: name.to_string(),
-					arguments,
-				}],
+				tool_calls: vec![ToolCall::new(format!("mock_call_{}", messages.len()), name, arguments)],
 				..Default::default()
 			});
 		}

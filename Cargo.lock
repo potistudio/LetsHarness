@@ -664,6 +664,7 @@ dependencies = [
  "clap",
  "letsharness-kernel",
  "letsharness-provider-commandcode",
+ "letsharness-provider-gemini",
  "letsharness-provider-mock",
  "letsharness-tool-builtin",
  "serde_json",
@@ -690,6 +691,17 @@ dependencies = [
  "letsharness-kernel",
  "reqwest",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "letsharness-provider-gemini"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "letsharness-kernel",
+ "reqwest",
  "serde_json",
 ]
 

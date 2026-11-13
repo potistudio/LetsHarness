@@ -6,12 +6,13 @@ use clap::{Parser, Subcommand};
 
 use letsharness_kernel::{self as llm, ChatMessage, Provider};
 use letsharness_provider_commandcode::CommandCodeProvider;
+use letsharness_provider_gemini::GeminiProvider;
 use letsharness_provider_mock::MockClient;
 
 #[derive(Parser)]
 #[command(name = "letsharness", about = "Command Code Provider API をRustから直接叩く")]
 struct Cli {
-	/// 差し替えポイント: commandcode | mock
+	/// 差し替えポイント: commandcode | gemini | mock
 	#[arg(long, global = true, default_value = "commandcode")]
 	provider: String,
 	/// mock用: 応答prefix (provider=mock時のみ)
@@ -114,7 +115,11 @@ fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) ->
 			let client = CommandCodeProvider::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 			Ok(Arc::new(client))
 		}
-		other => Err(anyhow::anyhow!("unknown provider: {other} (commandcode|mock)")),
+		"gemini" => {
+			let client = GeminiProvider::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+			Ok(Arc::new(client))
+		}
+		other => Err(anyhow::anyhow!("unknown provider: {other} (commandcode|gemini|mock)")),
 	}
 }
 

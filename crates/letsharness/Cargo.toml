@@ -13,6 +13,7 @@ repository.workspace = true
 [dependencies]
 letsharness-kernel.workspace = true
 letsharness-provider-commandcode.workspace = true
+letsharness-provider-gemini.workspace = true
 letsharness-provider-mock.workspace = true
 letsharness-tool-builtin.workspace = true
 tokio.workspace = true

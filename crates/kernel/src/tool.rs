@@ -38,6 +38,21 @@ pub struct ToolCall {
 	pub id: String,
 	pub name: String,
 	pub arguments: serde_json::Value,
+	/// プロバイダ固有の付帯情報 (例: Gemini の `thoughtSignature`)。
+	/// 履歴として同じプロバイダへ送り返すときに使う。他のプロバイダは無視する。
+	#[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+	pub extra: serde_json::Value,
+}
+
+impl ToolCall {
+	pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: serde_json::Value) -> Self {
+		Self {
+			id: id.into(),
+			name: name.into(),
+			arguments,
+			extra: serde_json::Value::Null,
+		}
+	}
 }
 
 /// ツールの実行結果。モデルへはそのままテキストとして返る。
