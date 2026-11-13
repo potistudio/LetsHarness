@@ -8,11 +8,43 @@
 //!   `"..."` (エスケープ `\n \r \t \" \\` と複数行) / `'...'` (リテラル、複数行) /
 //!   クォートなし値の行末コメント (`KEY=v # comment`)。
 //! - `${VAR}` の展開はしない。
+//!
+//! kernel の [`Plugin`] として `early_init` フェーズで動き、`--env-file <PATH>` /
+//! `--no-env-file` を起動引数から抜き取る (Frontend はこのプラグインを知らなくてよい)。
 
 use std::path::{Path, PathBuf};
 
+use letsharness_kernel::{BootArgs, Plugin};
+
 /// 既定のファイル名。
 pub const FILE_NAME: &str = ".env";
+
+/// `.env` を読み込む kernel プラグイン。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DotenvPlugin;
+
+impl Plugin for DotenvPlugin {
+	fn name(&self) -> &'static str {
+		"dotenv"
+	}
+
+	fn early_init(&self, args: &mut BootArgs) -> letsharness_kernel::Result<()> {
+		let no_env_file = args.take_flag("--no-env-file");
+		let env_file = args.take_value("--env-file")?;
+		if no_env_file {
+			if env_file.is_some() {
+				return Err(letsharness_kernel::Error::Config(
+					"--env-file と --no-env-file は同時に指定できません".into(),
+				));
+			}
+			return Ok(());
+		}
+		// SAFETY: `early_init` は kernel の `run_early_init` 経由で、ランタイム起動前に呼ばれる (その Safety 契約)。
+		unsafe { load(env_file.as_deref().map(Path::new)) }
+			.map_err(|e| letsharness_kernel::Error::plugin(self.name(), e))?;
+		Ok(())
+	}
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -217,6 +249,25 @@ fn strip_inline_comment(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn plugin_consumes_its_flags_and_leaves_the_rest() {
+		let mut args = BootArgs::new(["prog", "--no-env-file", "chat", "--prompt", "hi"]);
+		DotenvPlugin.early_init(&mut args).unwrap();
+		let rest: Vec<_> = args
+			.into_args()
+			.into_iter()
+			.map(|a| a.to_string_lossy().into_owned())
+			.collect();
+		assert_eq!(rest, ["prog", "chat", "--prompt", "hi"]);
+	}
+
+	#[test]
+	fn plugin_rejects_conflicting_flags() {
+		let mut args = BootArgs::new(["prog", "--env-file", "x.env", "--no-env-file"]);
+		let err = DotenvPlugin.early_init(&mut args).unwrap_err();
+		assert!(matches!(err, letsharness_kernel::Error::Config(_)));
+	}
 
 	fn kv(src: &str) -> Vec<(String, String)> {
 		parse(src).unwrap()

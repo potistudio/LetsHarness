@@ -698,6 +698,7 @@ dependencies = [
 name = "letsharness-plugin-dotenv"
 version = "0.1.0"
 dependencies = [
+ "letsharness-kernel",
  "thiserror",
 ]
 

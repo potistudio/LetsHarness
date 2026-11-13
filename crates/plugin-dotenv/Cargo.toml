@@ -10,4 +10,5 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+letsharness-kernel.workspace = true
 thiserror.workspace = true

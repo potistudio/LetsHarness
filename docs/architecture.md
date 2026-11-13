@@ -23,17 +23,18 @@ kernel は拡張点の受け口と実行基盤だけを持ち、CLI・プロバ�
 
 1. **main.rs はロジックを持たない。** どのプラグインを同梱するかを決めるだけの composition root（ディストリのマニフェスト）。将来は kernel をライブラリとして公開し、ユーザーが自分の `main.rs` で独自ハーネスを組めるようにする。
 2. **拡張点は kernel が決め打ちしない。** `Registry` は `TypeId` をキーにした汎用の入れ物で、拡張点の trait はそれを使うプラグインが定義してよい（例: `CliCommand` は `frontend-cli` が定義する）。
-3. **Frontend は Provider を直接呼ばない。** 必ず `Host` / `Session` を経由し、hook と tool がどの Frontend からでも同じように効くようにする。
-4. **モデルとエージェントを分ける。** 分ける軸は認証方式 (APIキー / CLI のログイン) ではなく「エージェントループを誰が回すか」。1回の呼び出しがモデル1回で、ツール・履歴をこちらが持つものは `Provider`。ループ・ツール・会話履歴を相手が持つもの (Antigravity CLI など) は `AgentBackend`。CLI の保存済み認証情報で API を直接叩くなら、それは `Provider`。
-5. **Provider の `chat` は1本。** wire（chat/completions, responses, messages）の選択は各 Provider の内部事情。戻り値は `BoxStream<ChatEvent>` で、非ストリームは collect するだけ。
-6. **kernel の型はプロセス境界を越えられる形にする。** 独自拡張は `extra: serde_json::Value` のみとし、`as_any()` のような境界を越えないものは使わない。エラーは `Unsupported` / `Config` / `Api` / `Plugin { source }` に限定し、特定実装の型を持ち込まない。
-7. **プロバイダは「種類 (kind)」と「インスタンス」を分ける。** 同じ kind をキーや設定を変えて複数インスタンス化できる。設定ファイルが無い場合は kind と同名のインスタンスを暗黙に作る。
+3. **プラグイン同士は直接依存しない。** Client (Frontend) も広義のプラグインで、他のプラグインとは `Host` / `Registry` 越しにしか繋がらない。起動前の処理 (`.env` 読み込みなど) は `Plugin::early_init` に載せ、`BootArgs` で自分のフラグだけを抜き取る。Cargo の依存として `plugin-*` を持ってよいのは composition root (`main.rs`) だけ。
+4. **Frontend は Provider を直接呼ばない。** 必ず `Host` / `Session` を経由し、hook と tool がどの Frontend からでも同じように効くようにする。
+5. **モデルとエージェントを分ける。** 分ける軸は認証方式 (APIキー / CLI のログイン) ではなく「エージェントループを誰が回すか」。1回の呼び出しがモデル1回で、ツール・履歴をこちらが持つものは `Provider`。ループ・ツール・会話履歴を相手が持つもの (Antigravity CLI など) は `AgentBackend`。CLI の保存済み認証情報で API を直接叩くなら、それは `Provider`。
+6. **Provider の `chat` は1本。** wire（chat/completions, responses, messages）の選択は各 Provider の内部事情。戻り値は `BoxStream<ChatEvent>` で、非ストリームは collect するだけ。
+7. **kernel の型はプロセス境界を越えられる形にする。** 独自拡張は `extra: serde_json::Value` のみとし、`as_any()` のような境界を越えないものは使わない。エラーは `Unsupported` / `Config` / `Api` / `Plugin { source }` に限定し、特定実装の型を持ち込まない。
+8. **プロバイダは「種類 (kind)」と「インスタンス」を分ける。** 同じ kind をキーや設定を変えて複数インスタンス化できる。設定ファイルが無い場合は kind と同名のインスタンスを暗黙に作る。
 
 ## Extension points
 
 | 拡張点 | 定義場所 | 用途 |
 | --- | --- | --- |
-| `Plugin` | kernel | すべてのプラグインの入口。`register(&mut Registry)` で各拡張点に登録する |
+| `Plugin` | kernel | すべてのプラグインの入口。`register(&mut Registry)` で各拡張点に登録する。ランタイム起動前に同期で走る `early_init(&mut BootArgs)` も持つ (実装済み。`register` は Registry と同時に導入) |
 | `Frontend` | kernel | CLI / TUI / Server。`run(host, args) -> ExitCode` |
 | `ProviderFactory` → `Provider` | kernel | LLM API。`create(cfg: Value)` でインスタンス化 |
 | `AgentBackend` | kernel | 依頼を受けて最終回答まで自走するもの。`BuiltinAgent` (`Provider` + `ToolRegistry` で `run_agent` を回す) と外部エージェント (`agent-*`)。外部はツールを自分で実行するため `approve` は呼ばず、承認は `ApprovalPolicy` (起動時の権限) で制御する |
@@ -47,7 +48,9 @@ CLI で未知のサブコマンドが来た場合は、PATH 上の `letsharness-
 
 優先順位は `デフォルト < 設定ファイル < 環境変数 < CLI (-o key=value)`。
 
-`.env` は `crates/plugin-dotenv` がランタイム起動前に読み込み、未設定の環境変数だけを埋める（`.env < 環境変数`）。カレントから親へ遡って探し、`--env-file <PATH>` で指定、`--no-env-file` で無効化できる。
+`.env` は `crates/plugin-dotenv` (`DotenvPlugin`) が `Plugin::early_init` でランタイム起動前に読み込み、未設定の環境変数だけを埋める（`.env < 環境変数`）。カレントから親へ遡って探し、`--env-file <PATH>` で指定、`--no-env-file` で無効化できる。
+
+これらのフラグはプラグインが `BootArgs` から抜き取るため、Frontend (clap) は `.env` の存在を知らない。`--help` には Frontend 側の `after_help` で手書きしている。
 
 ```toml
 frontend = "cli"

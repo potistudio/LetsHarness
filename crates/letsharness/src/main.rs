@@ -6,13 +6,19 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 
 use letsharness_agent_antigravity::AntigravityAgent;
-use letsharness_kernel::{self as llm, AgentBackend, ChatMessage, Provider};
+use letsharness_kernel::{self as llm, AgentBackend, BootArgs, ChatMessage, Plugin, Provider, run_early_init};
+use letsharness_plugin_dotenv::DotenvPlugin;
 use letsharness_provider_commandcode::CommandCodeProvider;
 use letsharness_provider_gemini::GeminiProvider;
 use letsharness_provider_mock::MockClient;
 
 #[derive(Parser)]
-#[command(name = "letsharness", about = "Command Code Provider API をRustから直接叩く")]
+#[command(
+	name = "letsharness",
+	about = "Command Code Provider API をRustから直接叩く",
+	// プラグインが clap より前に抜き取るフラグ。ここには出ないので手で書く。
+	after_help = "Plugin options (dotenv):\n  --env-file <PATH>  読み込む `.env` ファイル。省略時はカレントから親へ遡って探す (環境変数 > .env)\n  --no-env-file      `.env` を読み込まない"
+)]
 struct Cli {
 	/// モデルの差し替えポイント: commandcode | gemini | mock
 	#[arg(long, global = true, default_value = "commandcode")]
@@ -29,14 +35,6 @@ struct Cli {
 	/// mock用: 指定すると全リクエストをこのメッセージで失敗させる
 	#[arg(long, global = true, default_value = None)]
 	mock_error: Option<String>,
-	/// 読み込む `.env` ファイル。省略時はカレントから親へ遡って `.env` を探す
-	///
-	/// 既に設定済みの環境変数は上書きしない (環境変数 > .env)。
-	#[arg(long, global = true, value_name = "PATH", conflicts_with = "no_env_file")]
-	env_file: Option<std::path::PathBuf>,
-	/// `.env` を読み込まない
-	#[arg(long, global = true, default_value_t = false)]
-	no_env_file: bool,
 
 	#[command(subcommand)]
 	cmd: Cmd,
@@ -176,11 +174,14 @@ fn ensure_builtin(backend: &str, command: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-	let cli = Cli::parse();
-	if !cli.no_env_file {
-		// SAFETY: tokio ランタイム起動前で、環境変数に触るスレッドは main のみ。
-		unsafe { letsharness_plugin_dotenv::load(cli.env_file.as_deref()) }?;
-	}
+	// 同梱プラグイン。bin はどれが入っているかを決めるだけで、各プラグインの中身は知らない。
+	let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(DotenvPlugin)];
+
+	let mut boot = BootArgs::from_env();
+	// SAFETY: tokio ランタイム起動前で、スレッドは main のみ。
+	unsafe { run_early_init(&plugins, &mut boot) }?;
+
+	let cli = Cli::parse_from(boot.into_args());
 	tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()?
