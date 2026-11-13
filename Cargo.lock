@@ -663,6 +663,7 @@ dependencies = [
  "async-trait",
  "clap",
  "letsharness-kernel",
+ "letsharness-plugin-dotenv",
  "letsharness-provider-commandcode",
  "letsharness-provider-gemini",
  "letsharness-provider-mock",
@@ -680,6 +681,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "letsharness-plugin-dotenv"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

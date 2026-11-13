@@ -1,0 +1,13 @@
+[package]
+name = "letsharness-plugin-dotenv"
+description = "Loads `.env` files into the process environment for LetsHarness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true

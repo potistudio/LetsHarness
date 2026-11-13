@@ -44,6 +44,8 @@ CLI で未知のサブコマンドが来た場合は、PATH 上の `letsharness-
 
 優先順位は `デフォルト < 設定ファイル < 環境変数 < CLI (-o key=value)`。
 
+`.env` は `crates/plugin-dotenv` がランタイム起動前に読み込み、未設定の環境変数だけを埋める（`.env < 環境変数`）。カレントから親へ遡って探し、`--env-file <PATH>` で指定、`--no-env-file` で無効化できる。
+
 ```toml
 frontend = "cli"
 default_provider = "cc"

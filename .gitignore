@@ -6,3 +6,8 @@ target/
 
 # Personal references
 refs/
+
+# Local secrets
+.env
+.env.*
+!.env.example

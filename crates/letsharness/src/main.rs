@@ -21,6 +21,14 @@ struct Cli {
 	/// mock用: 指定すると全リクエストをこのメッセージで失敗させる
 	#[arg(long, global = true, default_value = None)]
 	mock_error: Option<String>,
+	/// 読み込む `.env` ファイル。省略時はカレントから親へ遡って `.env` を探す
+	///
+	/// 既に設定済みの環境変数は上書きしない (環境変数 > .env)。
+	#[arg(long, global = true, value_name = "PATH", conflicts_with = "no_env_file")]
+	env_file: Option<std::path::PathBuf>,
+	/// `.env` を読み込まない
+	#[arg(long, global = true, default_value_t = false)]
+	no_env_file: bool,
 
 	#[command(subcommand)]
 	cmd: Cmd,
@@ -123,9 +131,19 @@ fn make_client(provider: &str, mock_prefix: &str, mock_error: Option<String>) ->
 	}
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
 	let cli = Cli::parse();
+	if !cli.no_env_file {
+		// SAFETY: tokio ランタイム起動前で、環境変数に触るスレッドは main のみ。
+		unsafe { letsharness_plugin_dotenv::load(cli.env_file.as_deref()) }?;
+	}
+	tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.build()?
+		.block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
 	let client = make_client(&cli.provider, &cli.mock_prefix, cli.mock_error)?;
 
 	match cli.cmd {
