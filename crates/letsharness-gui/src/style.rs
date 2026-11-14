@@ -46,8 +46,22 @@ pub fn sidebar(_: &Theme) -> container::Style {
 	fill(SIDEBAR, 0.0)
 }
 
-pub fn divider(_: &Theme) -> container::Style {
-	fill(BORDER, 0.0)
+/// 角丸で浮いたメインパネル。
+pub fn panel(_: &Theme) -> container::Style {
+	container::Style {
+		background: Some(BG.into()),
+		border: Border {
+			color: BORDER,
+			width: 1.0,
+			radius: 16.0.into(),
+		},
+		shadow: Shadow {
+			color: Color::from_rgba8(0, 0, 0, 0.05),
+			offset: Vector::new(0.0, 1.0),
+			blur_radius: 8.0,
+		},
+		..container::Style::default()
+	}
 }
 
 pub fn user_bubble(_: &Theme) -> container::Style {

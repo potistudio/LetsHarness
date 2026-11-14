@@ -342,8 +342,16 @@ impl App {
 	}
 
 	fn view(&self) -> Element<'_, Message> {
-		let divider = container(space()).width(1).height(Fill).style(style::divider);
-		row![self.sidebar(), divider, self.main()].into()
+		// サイドバーの地の上に、メインパネルを角丸のカードとして浮かせる。
+		let panel = container(self.main())
+			.width(Fill)
+			.height(Fill)
+			.clip(true)
+			.style(style::panel);
+		container(row![self.sidebar(), panel])
+			.padding(iced::Padding::new(10.0).left(0))
+			.style(style::sidebar)
+			.into()
 	}
 
 	fn sidebar(&self) -> Element<'_, Message> {
@@ -391,7 +399,6 @@ impl App {
 		.width(260)
 		.height(Fill)
 		.padding(12)
-		.style(style::sidebar)
 		.into()
 	}
 
