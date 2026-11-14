@@ -137,30 +137,23 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<Manifest> {
 // 接続
 // ---------------------------------------------------------------------------
 
-/// 通信中にプラグインから届く通知 / 問い合わせ。
+/// 通信中にプラグインから届く通知。
 #[derive(Debug)]
 pub struct Event {
 	pub method: String,
 	pub params: Value,
-	/// 問い合わせ (応答が要る) のときの id。
-	/// 現在 `PluginServer` にはこれを送る API が無い (プロトコル上の予約)。
-	pub reply_id: Option<u64>,
 }
 
-/// [`Call`] の途中で届く [`Event`] の受け手。戻り値は問い合わせ (応答が要るもの) への答え。
-#[async_trait::async_trait]
+/// [`Call`] の途中で届く [`Event`] の受け手。
 pub trait EventSink: Send {
-	async fn on_event(&mut self, method: &str, params: Value) -> Option<Result<Value>>;
+	fn on_event(&mut self, method: &str, params: Value);
 }
 
 /// 途中経過を使わない呼び出し用。
 pub struct NoEvents;
 
-#[async_trait::async_trait]
 impl EventSink for NoEvents {
-	async fn on_event(&mut self, _method: &str, _params: Value) -> Option<Result<Value>> {
-		None
-	}
+	fn on_event(&mut self, _method: &str, _params: Value) {}
 }
 
 struct Pending {
@@ -273,12 +266,12 @@ async fn read_loop(stdout: BufReader<tokio::process::ChildStdout>, state: Arc<St
 			Ok(None) => break "plugin exited".to_string(),
 			Err(e) => break format!("read: {e}"),
 		};
-		let Ok(frame) = serde_json::from_str::<Frame>(&line) else {
+		let Ok(mut frame) = serde_json::from_str::<Frame>(&line) else {
 			eprintln!("warning: plugin sent a malformed line: {line}");
 			continue;
 		};
 		let mut inner = state.lock().unwrap();
-		match (frame.id, frame.method.clone()) {
+		match (frame.id, frame.method.take()) {
 			// 応答
 			(Some(id), None) => {
 				if let Some(p) = inner.pending.remove(&id) {
@@ -289,15 +282,18 @@ async fn read_loop(stdout: BufReader<tokio::process::ChildStdout>, state: Arc<St
 					let _ = p.done.send(result);
 				}
 			}
-			// 通知 / プラグインからの問い合わせ
-			(reply_id, Some(method)) => {
+			// 通知
+			(None, Some(method)) => {
 				if let Some(p) = frame.req().and_then(|r| inner.pending.get(&r)) {
 					let _ = p.events.send(Event {
 						method,
 						params: frame.params.unwrap_or(Value::Null),
-						reply_id,
 					});
 				}
+			}
+			// プラグインからのリクエストはプロトコルに無い。応答できないので、黙って待たせないよう警告する。
+			(Some(id), Some(method)) => {
+				eprintln!("warning: plugin sent an unsupported request `{method}` (id {id}); ignored");
 			}
 			(None, None) => {}
 		}
@@ -331,7 +327,7 @@ impl Call {
 			tokio::select! {
 				biased;
 				ev = self.events.recv() => match ev {
-					Some(ev) => self.handle(ev, sink).await,
+					Some(ev) => sink.on_event(&ev.method, ev.params),
 					None => {
 						let done = (&mut self.done).await;
 						return self.finish(done);
@@ -339,23 +335,11 @@ impl Call {
 				},
 				done = &mut self.done => {
 					while let Ok(ev) = self.events.try_recv() {
-						self.handle(ev, sink).await;
+						sink.on_event(&ev.method, ev.params);
 					}
 					return self.finish(done);
 				}
 			}
-		}
-	}
-
-	async fn handle(&self, ev: Event, sink: &mut dyn EventSink) {
-		let answer = sink.on_event(&ev.method, ev.params).await;
-		if let Some(id) = ev.reply_id {
-			let reply = match answer {
-				Some(Ok(v)) => Frame::ok(id, v),
-				Some(Err(e)) => Frame::err(id, WireError::from(&e)),
-				None => Frame::ok(id, Value::Null),
-			};
-			let _ = self.conn.send(reply).await;
 		}
 	}
 

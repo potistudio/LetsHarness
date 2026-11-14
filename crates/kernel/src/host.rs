@@ -147,16 +147,14 @@ struct StreamSink<'a> {
 	on_thinking: &'a mut (dyn for<'x> FnMut(&'x str) + Send),
 }
 
-#[async_trait::async_trait]
 impl EventSink for StreamSink<'_> {
-	async fn on_event(&mut self, method: &str, params: Value) -> Option<Result<Value>> {
+	fn on_event(&mut self, method: &str, params: Value) {
 		let text = params.get("text").and_then(Value::as_str).unwrap_or_default();
 		match method {
 			"stream.delta" => (self.on_delta)(text),
 			"stream.thinking" => (self.on_thinking)(text),
 			_ => {}
 		}
-		None
 	}
 }
 
@@ -322,9 +320,8 @@ struct HandlerSink<'a> {
 	handler: &'a mut dyn RunHandler,
 }
 
-#[async_trait::async_trait]
 impl EventSink for HandlerSink<'_> {
-	async fn on_event(&mut self, method: &str, params: Value) -> Option<Result<Value>> {
+	fn on_event(&mut self, method: &str, params: Value) {
 		let text = || {
 			params
 				.get("text")
@@ -349,7 +346,6 @@ impl EventSink for HandlerSink<'_> {
 			}
 			_ => {}
 		}
-		None
 	}
 }
 

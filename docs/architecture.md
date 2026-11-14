@@ -102,11 +102,10 @@ path = "~/.letsharness/plugins/openai-compat"
 
 - すべてのプラグインは別プロセス。Rust の ABI で dylib を読み込むことはしない。プラグインがクラッシュしても kernel は巻き込まれない。
 - 運ぶ手段は **stdio (1行1メッセージの JSON-RPC 風)**。メッセージは `crates/kernel/src/rpc.rs`。
-  - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。
-  - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。プラグインから kernel への問い合わせは、同じ `req` を持つリクエストとして扱う (プロトコル上の予約で、現在 `PluginServer` に送る API は無い)。
+  - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。向きは kernel → プラグインのみ。
+  - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。
   - 型の後方互換は保証しない。プラグインと kernel は同じバージョンでビルドする。
   - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call`。
-  - プラグイン → kernel: 現在は無い。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
 - Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。

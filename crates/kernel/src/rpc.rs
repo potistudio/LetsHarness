@@ -1,10 +1,9 @@
 //! プラグインとの線の上のメッセージ (stdio, 1行1メッセージの JSON-RPC 風)。
 //!
 //! - リクエスト : `{"id", "method", "params"}` → 応答 `{"id", "result"}` または `{"id", "error"}`
+//!   (向きは Kernel → プラグインのみ)
 //! - 通知       : `{"method", "params"}` (応答なし)
 //! - ストリームやエージェントの途中経過は、`params.req` に元リクエストの `id` を入れた通知で流す。
-//!   プラグインから Kernel への問い合わせは `params.req` を持つリクエストで、Kernel は元リクエストの
-//!   処理の中で答える (プロトコル上の予約。現在 `PluginServer` に送る API は無い)。
 //! - 結果が `null` だと「無い」と区別できないので、空の結果は `{}` にする。
 
 use serde::{Deserialize, Serialize};
