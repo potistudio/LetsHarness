@@ -3,8 +3,10 @@
 use iced::widget::{button, column, container, markdown, pick_list, rich_text, scrollable, text, text_editor};
 use iced::{Background, Border, Color, Element, Fill, Font, Shadow, Theme, Vector, border, color, font, theme};
 
-pub const BG: Color = color!(0xFAF9F5);
-pub const SIDEBAR: Color = color!(0xF5F4ED);
+use crate::squircle::{Surface, squircle};
+
+pub const BG: Color = color!(0xFCFCFD);
+pub const SIDEBAR: Color = color!(0xF8F8F9);
 pub const SURFACE: Color = color!(0xFFFFFF);
 pub const BUBBLE: Color = color!(0xF0EEE6);
 pub const HOVER: Color = color!(0xEAE7DD);
@@ -14,6 +16,7 @@ pub const MUTED: Color = color!(0x77756C);
 pub const ACCENT: Color = color!(0xD97757);
 pub const ACCENT_HOVER: Color = color!(0xC6613F);
 pub const DANGER: Color = color!(0xB53333);
+pub const RADIUS: f32 = 8.0;
 
 pub const SERIF: Font = Font {
 	family: font::Family::Serif,
@@ -46,56 +49,49 @@ pub fn sidebar(_: &Theme) -> container::Style {
 	fill(SIDEBAR, 0.0)
 }
 
-/// 角丸で浮いたメインパネル。
-pub fn panel(_: &Theme) -> container::Style {
-	container::Style {
-		background: Some(BG.into()),
-		border: Border {
-			color: BORDER,
-			width: 1.0,
-			radius: 16.0.into(),
-		},
-		shadow: Shadow {
-			color: Color::from_rgba8(0, 0, 0, 0.05),
-			offset: Vector::new(0.0, 1.0),
-			blur_radius: 8.0,
-		},
-		..container::Style::default()
-	}
-}
+/// 浮いたメインパネル。
+pub const PANEL: Surface = Surface {
+	radius: RADIUS,
+	fill: BG,
+	border: Some(BORDER),
+	shadow: Some(Shadow {
+		color: Color::from_rgba8(0, 0, 0, 0.05),
+		offset: Vector::new(0.0, 1.0),
+		blur_radius: 8.0,
+	}),
+};
 
-pub fn user_bubble(_: &Theme) -> container::Style {
-	fill(BUBBLE, 14.0)
-}
+pub const USER_BUBBLE: Surface = Surface {
+	radius: 14.0,
+	fill: BUBBLE,
+	border: None,
+	shadow: None,
+};
 
-pub fn thinking(_: &Theme) -> container::Style {
-	container::Style {
-		text_color: Some(MUTED),
-		border: Border {
-			color: BORDER,
-			width: 1.0,
-			radius: 10.0.into(),
-		},
-		..container::Style::default()
-	}
-}
+pub const THINKING: Surface = Surface {
+	radius: 10.0,
+	fill: Color::TRANSPARENT,
+	border: Some(BORDER),
+	shadow: None,
+};
 
-pub fn composer(_: &Theme) -> container::Style {
-	container::Style {
-		background: Some(SURFACE.into()),
-		border: Border {
-			color: BORDER,
-			width: 1.0,
-			radius: 18.0.into(),
-		},
-		shadow: Shadow {
-			color: Color::from_rgba8(0, 0, 0, 0.06),
-			offset: Vector::new(0.0, 2.0),
-			blur_radius: 12.0,
-		},
-		..container::Style::default()
-	}
-}
+pub const COMPOSER: Surface = Surface {
+	radius: 18.0,
+	fill: SURFACE,
+	border: Some(BORDER),
+	shadow: Some(Shadow {
+		color: Color::from_rgba8(0, 0, 0, 0.06),
+		offset: Vector::new(0.0, 2.0),
+		blur_radius: 12.0,
+	}),
+};
+
+const CODE_BLOCK: Surface = Surface {
+	radius: 10.0,
+	fill: color!(0xF3F1EA),
+	border: Some(BORDER),
+	shadow: None,
+};
 
 pub fn editor(_: &Theme, _: text_editor::Status) -> text_editor::Style {
 	text_editor::Style {
@@ -174,18 +170,6 @@ pub fn markdown_settings() -> markdown::Settings {
 	settings
 }
 
-fn code_block(_: &Theme) -> container::Style {
-	container::Style {
-		background: Some(color!(0xF3F1EA).into()),
-		border: Border {
-			color: BORDER,
-			width: 1.0,
-			radius: 10.0.into(),
-		},
-		..container::Style::default()
-	}
-}
-
 /// 既定の黒いコードブロックを、淡い背景 + 言語名のラベルに差し替える Markdown の描画。
 pub struct MarkdownViewer;
 
@@ -212,10 +196,9 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for MarkdownViewer {
 			scrollable::Scrollbar::default().width(4).scroller_width(4),
 		));
 		let label = language.filter(|l| !l.is_empty()).unwrap_or("code");
-		container(column![container(text(label).size(12).color(MUTED)).padding([0, 14]), code].spacing(6))
+		let block = container(column![container(text(label).size(12).color(MUTED)).padding([0, 14]), code].spacing(6))
 			.padding([10, 0])
-			.width(Fill)
-			.style(code_block)
-			.into()
+			.width(Fill);
+		squircle(block, CODE_BLOCK)
 	}
 }

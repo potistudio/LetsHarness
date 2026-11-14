@@ -3,6 +3,7 @@
 //! CLI と同じく `Kernel::boot` で Kernel を動かし、返ってきた [`Host`] に Provider を頼むだけ。
 //! 起動引数の `-o key=value` はそのまま Kernel とプロバイダに渡す。
 
+mod squircle;
 mod style;
 
 use std::sync::Arc;
@@ -14,6 +15,8 @@ use iced::widget::{
 	button, center, column, container, markdown, mouse_area, pick_list, row, scrollable, space, text, text_editor,
 };
 use iced::{Center, Element, Fill, Font, Length, Size, window};
+use squircle::squircle;
+
 use letsharness_kernel::{BootConfig, ChatMessage, ChatOutput, Host, Kernel, Provider};
 
 /// `messages` wire (Anthropic) で使う出力上限。
@@ -362,12 +365,8 @@ impl App {
 	}
 
 	fn view(&self) -> Element<'_, Message> {
-		// サイドバーの地の上に、メインパネルを角丸のカードとして浮かせる。
-		let panel = container(self.main())
-			.width(Fill)
-			.height(Fill)
-			.clip(true)
-			.style(style::panel);
+		// サイドバーの地の上に、メインパネルを squircle のカードとして浮かせる。
+		let panel = squircle(container(self.main()).width(Fill).height(Fill).clip(true), style::PANEL);
 		container(row![self.sidebar(), panel])
 			.padding(iced::Padding::new(10.0).left(0))
 			.style(style::sidebar)
@@ -472,10 +471,12 @@ impl App {
 
 	fn entry<'a>(&'a self, i: usize, e: &'a Entry) -> Element<'a, Message> {
 		if e.role == Role::User {
-			let bubble = container(text(&e.text).size(15))
-				.padding([10, 14])
-				.max_width(COLUMN_WIDTH * 0.8)
-				.style(style::user_bubble);
+			let bubble = squircle(
+				container(text(&e.text).size(15))
+					.padding([10, 14])
+					.max_width(COLUMN_WIDTH * 0.8),
+				style::USER_BUBBLE,
+			);
 			return row![space::horizontal(), bubble].into();
 		}
 
@@ -489,12 +490,12 @@ impl App {
 					.style(style::ghost),
 			);
 			if e.show_thinking {
-				body = body.push(
-					container(text(e.thinking.trim()).size(13))
+				body = body.push(squircle(
+					container(text(e.thinking.trim()).size(13).color(style::MUTED))
 						.padding([10, 14])
-						.width(Fill)
-						.style(style::thinking),
-				);
+						.width(Fill),
+					style::THINKING,
+				));
 			}
 		}
 		let streaming = self
@@ -576,11 +577,10 @@ impl App {
 		if let Some(notice) = &self.notice {
 			composer = composer.push(text(notice).size(12).color(style::DANGER));
 		}
-		container(composer)
-			.padding([12, 14])
-			.width(Length::Fill)
-			.style(style::composer)
-			.into()
+		squircle(
+			container(composer).padding([12, 14]).width(Length::Fill),
+			style::COMPOSER,
+		)
 	}
 }
 
