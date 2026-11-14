@@ -10,21 +10,39 @@ use std::sync::Arc;
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
 use iced::task::{self, Task};
-use iced::widget::{button, center, column, container, markdown, pick_list, row, scrollable, space, text, text_editor};
-use iced::{Center, Element, Fill, Font, Length, Size};
+use iced::widget::{
+	button, center, column, container, markdown, mouse_area, pick_list, row, scrollable, space, text, text_editor,
+};
+use iced::{Center, Element, Fill, Font, Length, Size, window};
 use letsharness_kernel::{BootConfig, ChatMessage, ChatOutput, Host, Kernel, Provider};
 
 /// `messages` wire (Anthropic) で使う出力上限。
 const MAX_TOKENS: u32 = 4096;
 /// 会話欄の最大幅。
 const COLUMN_WIDTH: f32 = 720.0;
+/// OS のタイトルバーの代わりに空けておく高さ。macOS では信号機ボタンがここに重なり、ドラッグで窓を動かせる。
+const TITLEBAR_HEIGHT: f32 = if cfg!(target_os = "macos") { 28.0 } else { 0.0 };
 
 fn main() -> iced::Result {
 	iced::application(App::boot, App::update, App::view)
 		.title(App::title)
 		.theme(|_: &App| style::theme())
-		.window_size(Size::new(1100.0, 760.0))
+		.window(window_settings())
 		.run()
+}
+
+/// macOS ではタイトルバーを消して中身を窓いっぱいに広げ、信号機ボタンだけ残す。
+fn window_settings() -> window::Settings {
+	window::Settings {
+		size: Size::new(1100.0, 760.0),
+		#[cfg(target_os = "macos")]
+		platform_specific: window::settings::PlatformSpecific {
+			title_hidden: true,
+			titlebar_transparent: true,
+			fullsize_content_view: true,
+		},
+		..window::Settings::default()
+	}
 }
 
 /// `-o key=value` を集める (CLI と同じ形)。
@@ -155,6 +173,7 @@ enum Message {
 	SelectChat(usize),
 	ToggleThinking(usize),
 	Link(markdown::Uri),
+	DragWindow,
 }
 
 impl App {
@@ -276,6 +295,7 @@ impl App {
 				}
 			}
 			Message::Link(url) => open_url(&url),
+			Message::DragWindow => return window::latest().and_then(window::drag),
 		}
 		Task::none()
 	}
@@ -387,8 +407,11 @@ impl App {
 					.into()
 			});
 
+		let titlebar = mouse_area(space().width(Fill).height(TITLEBAR_HEIGHT)).on_press(Message::DragWindow);
+
 		container(
 			column![
+				titlebar,
 				container(brand).padding([6, 10]),
 				new_chat,
 				container(text("Recents").size(12).color(style::MUTED)).padding([0, 10]),
@@ -398,7 +421,7 @@ impl App {
 		)
 		.width(260)
 		.height(Fill)
-		.padding(12)
+		.padding(iced::Padding::new(12.0).top(0))
 		.into()
 	}
 
