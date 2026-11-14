@@ -3,7 +3,7 @@
 //! やることは `Kernel::boot` で Kernel を動かし、返ってきた [`Host`] に頼むだけ。
 //! どんなプラグインがあるか、どのプロセスでどう動いているかは知らない。
 
-mod agent;
+mod exec;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -49,9 +49,8 @@ struct Cli {
 	/// モデルの差し替えポイント (登録されたプロバイダの kind): commandcode | gemini | mock
 	#[arg(long, global = true, default_value = "commandcode")]
 	provider: String,
-	/// エージェントの担い手 (登録されたエージェントの kind)。`agent` は省略すると `loop`、`models` は省略すると `--provider` を引く
+	/// 外部エージェントの kind (`agent` で必須。`models` で指定すると、そのエージェントのモデルを引く)
 	///
-	/// loop        : --provider のモデル + ローカルツールで LetsHarness がループを回す
 	/// antigravity : Antigravity CLI (`agy`) に丸ごと任せる (ツール・認証も agy 側)
 	#[arg(long, global = true)]
 	backend: Option<String>,
@@ -107,15 +106,41 @@ enum Cmd {
 		#[arg(long)]
 		json: bool,
 	},
-	/// ツールを使いながら最終回答まで自走する (非ストリーム)
+	/// --provider のモデルとツールでループを回し、最終回答まで進める (非ストリーム)
 	///
-	/// --backend loop (既定): ローカルツール read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
+	/// ツールは read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
 	/// 承認は実行ごとに stderr で確認する。`--yes` で全承認 (bash は何でも実行できるので注意)。
+	Loop {
+		#[arg(long)]
+		model: String,
+		#[arg(long)]
+		prompt: String,
+		#[arg(long)]
+		system: Option<String>,
+		#[arg(long)]
+		max_tokens: Option<u32>,
+		/// モデル呼び出しの上限回数 (暴走防止)
+		#[arg(long, default_value_t = llm::DEFAULT_MAX_STEPS)]
+		max_steps: usize,
+		/// ツールの作業ディレクトリ。ファイル系ツールはこの外に出られない
+		#[arg(long, default_value = ".")]
+		workdir: std::path::PathBuf,
+		/// 承認が必要なツールを確認なしで実行する
+		#[arg(long, default_value_t = false)]
+		yes: bool,
+		/// 思考過程を表示しない
+		#[arg(long, default_value_t = false)]
+		no_thinking: bool,
+		/// 全ステップ合算の usage をstderrに表示
+		#[arg(long, default_value_t = false)]
+		show_usage: bool,
+	},
+	/// 外部エージェント (--backend) に最終回答まで丸ごと任せる (非ストリーム)
 	///
-	/// --backend antigravity: agy が自分のツールで動く。承認はこちらに求められず、
+	/// 例: --backend antigravity は agy が自分のツールで動く。承認はこちらに求められず、
 	/// agy の権限設定で許可されていない操作は却下される (`--yes` で全許可)。
 	Agent {
-		/// loop では必須。antigravity で省略すると agy の既定モデル
+		/// 省略するとエージェントの既定モデル
 		#[arg(long)]
 		model: Option<String>,
 		#[arg(long)]
@@ -166,28 +191,26 @@ async fn make_client(host: &Host, provider: &str, options: &[(String, String)]) 
 	}
 }
 
-/// エージェントを kernel に頼む。`provider` と `-o` はそのまま渡し、必要なエージェントだけが使う。
+/// 外部エージェントを kernel に頼む。`-o` はそのまま渡し、必要なエージェントだけが使う。
 async fn make_agent(
 	host: &Host,
 	backend: &str,
-	provider: &str,
 	options: &[(String, String)],
 	workdir: Option<&std::path::Path>,
 ) -> Result<Arc<dyn AgentBackend>> {
 	let mut cfg = options_cfg(options);
-	cfg["provider"] = json!(provider);
 	if let Some(dir) = workdir {
 		cfg["workdir"] = json!(dir);
 	}
 	Ok(host.agent_backend(backend, &cfg).await?)
 }
 
-/// `chat` / `quota` は Provider (モデル) 専用。
+/// `chat` / `quota` / `loop` は Provider (モデル) を使う。外部エージェントとは別。
 fn ensure_provider_only(backend: &Option<String>, command: &str) -> Result<()> {
 	if backend.is_none() {
 		return Ok(());
 	}
-	bail!("`{command}` はモデル (--provider) 専用です。--backend は `agent` / `models` でのみ使えます")
+	bail!("`{command}` はモデル (--provider) を使います。--backend は `agent` / `models` でのみ使えます")
 }
 
 async fn run(host: &Host, cli: Cli) -> Result<()> {
@@ -199,7 +222,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			// `dyn Provider` / `dyn AgentBackend` に対して呼ぶ = どの実装でも同じコード
 			let (name, models) = match &cli.backend {
 				Some(backend) => {
-					let agent = make_agent(host, backend, &cli.provider, &cli.options, None).await?;
+					let agent = make_agent(host, backend, &cli.options, None).await?;
 					(agent.name(), agent.list_models().await)
 				}
 				None => {
@@ -264,6 +287,39 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			ensure_provider_only(&cli.backend, "quota")?;
 			run_quota(&*client().await?, json).await?;
 		}
+		Cmd::Loop {
+			model,
+			prompt,
+			system,
+			max_tokens,
+			max_steps,
+			workdir,
+			yes,
+			no_thinking,
+			show_usage,
+		} => {
+			ensure_provider_only(&cli.backend, "loop")?;
+			// ツールの作業ディレクトリは `workdir`、プロバイダ固有の設定は `-o`。
+			let mut cfg = options_cfg(&cli.options);
+			cfg["workdir"] = json!(workdir);
+			exec::run_loop(
+				host,
+				&cli.provider,
+				&cfg,
+				exec::Options {
+					model,
+					prompt,
+					system,
+					max_tokens,
+					max_steps,
+					yes,
+					no_thinking,
+					show_usage,
+					resume: None,
+				},
+			)
+			.await?;
+		}
 		Cmd::Agent {
 			model,
 			prompt,
@@ -276,17 +332,16 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			show_usage,
 			resume,
 		} => {
-			let backend = make_agent(
-				host,
-				cli.backend.as_deref().unwrap_or("loop"),
-				&cli.provider,
-				&cli.options,
-				Some(&workdir),
-			)
-			.await?;
-			agent::run(
+			let Some(backend) = &cli.backend else {
+				bail!(
+					"agent には --backend が必要です (登録済み: {})",
+					host.agent_backend_kinds().join("|")
+				);
+			};
+			let backend = make_agent(host, backend, &cli.options, Some(&workdir)).await?;
+			exec::run_agent(
 				backend,
-				agent::Options {
+				exec::Options {
 					model: model.unwrap_or_default(),
 					prompt,
 					system,

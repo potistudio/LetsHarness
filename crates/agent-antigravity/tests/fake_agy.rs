@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use letsharness_agent_antigravity::AntigravityAgent;
 use letsharness_kernel::{
-	AgentBackend, AgentHandler, AgentRequest, ApprovalPolicy, ChatMessage, Error, ToolCall, ToolOutput, ToolSpec,
+	AgentBackend, AgentRequest, ApprovalPolicy, ChatMessage, Error, RunHandler, ToolCall, ToolOutput, ToolSpec,
 };
 
 /// `body` を本文とする実行可能スクリプトを作る。受け取った引数は `<name>.args` に1行ずつ残す。
@@ -37,7 +37,7 @@ fn read_args(path: &PathBuf) -> Vec<String> {
 struct Rec(Vec<String>);
 
 #[async_trait::async_trait]
-impl AgentHandler for Rec {
+impl RunHandler for Rec {
 	fn on_text(&mut self, t: &str) {
 		self.0.push(format!("text:{t}"));
 	}

@@ -10,7 +10,6 @@ use std::sync::Once;
 const PLUGINS: &[&str] = &[
 	"letsharness-provider-mock",
 	"letsharness-tool-local",
-	"letsharness-agent-loop",
 	"letsharness-plugin-dotenv",
 	"letsharness-agent-antigravity",
 ];
@@ -130,13 +129,13 @@ fn kernel_runs_without_any_plugin() {
 }
 
 #[test]
-fn loop_agent_borrows_model_and_tools_through_the_kernel() {
+fn kernel_loop_runs_external_provider_and_external_tools() {
 	let dir = std::env::temp_dir().join(format!("lh-e2e-{}", std::process::id()));
 	std::fs::create_dir_all(&dir).unwrap();
 	let out = letsharness(&[
 		"--provider",
 		"mock",
-		"agent",
+		"loop",
 		"--model",
 		"m",
 		"--prompt",
@@ -199,5 +198,38 @@ EOF
 	assert!(out.status.success(), "{se}");
 	assert!(so.contains("Hello from agy"), "{so}");
 	assert!(se.contains("read_file"), "tool call should be reported: {se}");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn agent_needs_an_explicit_backend() {
+	let out = letsharness(&["--provider", "mock", "agent", "--prompt", "hi"]);
+	assert!(!out.status.success());
+	assert!(
+		stderr(&out).contains("agent には --backend が必要です"),
+		"{}",
+		stderr(&out)
+	);
+}
+
+#[test]
+fn loop_asks_before_running_tools_that_need_approval() {
+	let dir = std::env::temp_dir().join(format!("lh-e2e-ask-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	// 非対話 (stdin が空) の承認は拒否になる。
+	let out = letsharness(&[
+		"--provider",
+		"mock",
+		"loop",
+		"--model",
+		"m",
+		"--prompt",
+		r#"tool:write_file {"path":"a.txt","content":"x"}"#,
+		"--workdir",
+		dir.to_str().unwrap(),
+	]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert!(!dir.join("a.txt").exists());
+	assert!(stdout(&out).contains("denied"), "{}", stdout(&out));
 	std::fs::remove_dir_all(&dir).unwrap();
 }

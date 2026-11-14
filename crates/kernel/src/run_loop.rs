@@ -1,23 +1,63 @@
-//! エージェントループ本体 (モデル呼び出し → ツール実行 → 結果を返して再呼び出し)。
+//! ループ本体。
 
-use letsharness_kernel::{
-	AgentHandler, AgentOutcome, AgentRequest, ApprovalPolicy, ChatMessage, Error, Provider, Result, ToolCall,
-	ToolOutput, ToolRegistry, Usage,
+use crate::{
+	ApprovalPolicy, ChatMessage, DEFAULT_MAX_STEPS, Error, Provider, Result, RunHandler, ToolCall, ToolOutput,
+	ToolRegistry, Usage,
 };
 
-pub async fn run_agent(
+/// ループの依頼。
+#[derive(Debug, Clone)]
+pub struct LoopRequest {
+	pub model: String,
+	pub messages: Vec<ChatMessage>,
+	pub max_tokens: Option<u32>,
+	/// モデルを呼ぶ回数の上限 (暴走防止)。
+	pub max_steps: usize,
+	pub approval: ApprovalPolicy,
+}
+
+impl LoopRequest {
+	pub fn new(model: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
+		Self {
+			model: model.into(),
+			messages,
+			max_tokens: None,
+			max_steps: DEFAULT_MAX_STEPS,
+			approval: ApprovalPolicy::default(),
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopOutcome {
+	/// 最終ターンの本文。
+	pub text: String,
+	/// 入力 + 途中のツール往復 + 最終回答を含む全履歴 (会話の継続に使える)。
+	pub messages: Vec<ChatMessage>,
+	/// モデルを呼んだ回数。
+	pub steps: usize,
+	/// 全ステップ合算の使用量 (どのステップも usage を返さなければ `None`)。
+	pub usage: Option<Usage>,
+	/// `max_steps` に達して打ち切った (最終ターンがまだツールを要求していた)。
+	/// このとき `messages` は未実行のツール要求を含まない。
+	pub hit_step_limit: bool,
+}
+
+/// モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答が出るまで繰り返す。
+///
+/// kernel の責務。モデルは [`Provider`]、ツールは [`ToolRegistry`] で、どこのプラグインのものかは知らない。
+pub async fn run_loop(
 	provider: &dyn Provider,
 	tools: &ToolRegistry,
-	handler: &mut dyn AgentHandler,
-	req: AgentRequest,
-) -> Result<AgentOutcome> {
-	let AgentRequest {
+	handler: &mut dyn RunHandler,
+	req: LoopRequest,
+) -> Result<LoopOutcome> {
+	let LoopRequest {
 		model,
 		mut messages,
 		max_tokens,
 		max_steps,
 		approval,
-		session_id: _,
 	} = req;
 	if max_steps == 0 {
 		return Err(Error::Config("max_steps は 1 以上が必要です".into()));
@@ -38,26 +78,24 @@ pub async fn run_agent(
 
 		if turn.tool_calls.is_empty() {
 			messages.push(ChatMessage::assistant(turn.text.clone()));
-			return Ok(AgentOutcome {
+			return Ok(LoopOutcome {
 				text: turn.text,
 				messages,
 				steps: step,
 				usage,
 				hit_step_limit: false,
-				session_id: None,
 			});
 		}
 		if !turn.text.is_empty() {
 			handler.on_text(&turn.text);
 		}
 		if step == max_steps {
-			return Ok(AgentOutcome {
+			return Ok(LoopOutcome {
 				text: turn.text,
 				messages,
 				steps: step,
 				usage,
 				hit_step_limit: true,
-				session_id: None,
 			});
 		}
 
@@ -82,7 +120,7 @@ pub async fn run_agent(
 
 async fn execute(
 	tools: &ToolRegistry,
-	handler: &mut dyn AgentHandler,
+	handler: &mut dyn RunHandler,
 	call: &ToolCall,
 	approval: ApprovalPolicy,
 ) -> ToolOutput {
@@ -138,7 +176,7 @@ mod tests {
 	use std::sync::{Arc, Mutex};
 
 	use super::*;
-	use letsharness_kernel::{Completion, ModelInfo, Tool, ToolSpec};
+	use crate::{Completion, ModelInfo, Tool, ToolSpec};
 
 	/// 台本どおりに Completion を返し、受け取ったリクエストを記録するプロバイダ。
 	struct Scripted {
@@ -239,7 +277,7 @@ mod tests {
 	}
 
 	#[async_trait::async_trait]
-	impl AgentHandler for Rec {
+	impl RunHandler for Rec {
 		fn on_text(&mut self, t: &str) {
 			self.events.push(format!("text:{t}"));
 		}
@@ -266,8 +304,8 @@ mod tests {
 			}))
 	}
 
-	fn req() -> AgentRequest {
-		AgentRequest::new("m", vec![ChatMessage::user("go")])
+	fn req() -> LoopRequest {
+		LoopRequest::new("m", vec![ChatMessage::user("go")])
 	}
 
 	#[tokio::test]
@@ -278,7 +316,7 @@ mod tests {
 			turn("done", vec![]),
 		]);
 		let mut h = Rec::default();
-		let out = run_agent(&p, &registry(&runs), &mut h, req()).await.unwrap();
+		let out = run_loop(&p, &registry(&runs), &mut h, req()).await.unwrap();
 
 		assert_eq!(out.text, "done");
 		assert_eq!(out.steps, 2);
@@ -313,7 +351,7 @@ mod tests {
 		let runs = Arc::new(Mutex::new(0));
 		let p = Scripted::new(vec![turn("", vec![call("c1", "danger")]), turn("ok", vec![])]);
 		let mut h = Rec::default(); // allow = false
-		let out = run_agent(&p, &registry(&runs), &mut h, req()).await.unwrap();
+		let out = run_loop(&p, &registry(&runs), &mut h, req()).await.unwrap();
 
 		assert_eq!(*runs.lock().unwrap(), 0, "拒否時は実行されない");
 		assert!(out.messages[2].content.starts_with("Error: denied"));
@@ -325,7 +363,7 @@ mod tests {
 			allow: true,
 			..Default::default()
 		};
-		run_agent(&p, &registry(&runs), &mut h, req()).await.unwrap();
+		run_loop(&p, &registry(&runs), &mut h, req()).await.unwrap();
 		assert_eq!(*runs.lock().unwrap(), 1);
 	}
 
@@ -336,7 +374,7 @@ mod tests {
 		let mut h = Rec::default(); // allow = false でも聞かれない
 		let mut r = req();
 		r.approval = ApprovalPolicy::AutoApprove;
-		run_agent(&p, &registry(&runs), &mut h, r).await.unwrap();
+		run_loop(&p, &registry(&runs), &mut h, r).await.unwrap();
 		assert_eq!(*runs.lock().unwrap(), 1);
 	}
 
@@ -344,7 +382,7 @@ mod tests {
 	async fn unknown_tool_is_reported_to_model_not_fatal() {
 		let runs = Arc::new(Mutex::new(0));
 		let p = Scripted::new(vec![turn("", vec![call("c1", "nope")]), turn("ok", vec![])]);
-		let out = run_agent(&p, &registry(&runs), &mut Rec::default(), req())
+		let out = run_loop(&p, &registry(&runs), &mut Rec::default(), req())
 			.await
 			.unwrap();
 		assert_eq!(out.messages[2].content, "Error: unknown tool: nope");
@@ -360,7 +398,7 @@ mod tests {
 		]);
 		let mut r = req();
 		r.max_steps = 2;
-		let out = run_agent(&p, &registry(&runs), &mut Rec::default(), r).await.unwrap();
+		let out = run_loop(&p, &registry(&runs), &mut Rec::default(), r).await.unwrap();
 		assert!(out.hit_step_limit);
 		assert_eq!(out.steps, 2);
 		assert_eq!(*runs.lock().unwrap(), 1, "上限ターンの要求は実行しない");
@@ -369,7 +407,7 @@ mod tests {
 
 		let mut r = req();
 		r.max_steps = 0;
-		let err = run_agent(&p, &registry(&runs), &mut Rec::default(), r).await;
+		let err = run_loop(&p, &registry(&runs), &mut Rec::default(), r).await;
 		assert!(matches!(err, Err(Error::Config(_))));
 	}
 }

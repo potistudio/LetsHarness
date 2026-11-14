@@ -11,16 +11,20 @@ use serde::{Deserialize, Serialize};
 mod agent;
 mod dispatch;
 mod external;
+mod handler;
 mod host;
 mod kernel;
 mod rpc;
+mod run_loop;
 mod serve;
 mod tool;
 
-pub use agent::{AgentBackend, AgentHandler, AgentOutcome, AgentRequest, ApprovalPolicy, DEFAULT_MAX_STEPS, HostApi};
+pub use agent::{AgentBackend, AgentOutcome, AgentRequest};
 pub use external::{Contributes, MANIFEST_FILE, Manifest};
+pub use handler::{ApprovalPolicy, DEFAULT_MAX_STEPS, RunHandler};
 pub use host::Host;
 pub use kernel::{BootConfig, Kernel};
+pub use run_loop::{LoopOutcome, LoopRequest, run_loop};
 pub use serve::{AgentBackendFactory, BootHook, PluginServer, ProviderFactory, ToolFactory};
 pub use tool::{Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
@@ -476,7 +480,7 @@ pub trait Provider: Send + Sync {
 		})
 	}
 
-	/// ツール定義つきの1ターン (非ストリーム)。ツール実行ループは [`run_agent`] が回す。
+	/// ツール定義つきの1ターン (非ストリーム)。ツール実行ループは [`run_loop`] が回す。
 	///
 	/// `tools` が空なら通常の `chat_with_usage` と同じ。空でないのに未対応の
 	/// プロバイダは `Err(Unsupported("tools"))` を返す。wire の選択は実装側の事情。

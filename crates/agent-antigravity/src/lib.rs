@@ -32,7 +32,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use letsharness_kernel::{
-	AgentBackend, AgentHandler, AgentOutcome, AgentRequest, ApprovalPolicy, ChatMessage, Error, ModelInfo, Result,
+	AgentBackend, AgentOutcome, AgentRequest, ApprovalPolicy, ChatMessage, Error, ModelInfo, Result, RunHandler,
 };
 
 use crate::events::{Event, RunResult, StepTracker};
@@ -204,7 +204,7 @@ impl AgentBackend for AntigravityAgent {
 			.collect())
 	}
 
-	async fn run(&self, req: AgentRequest, handler: &mut dyn AgentHandler) -> Result<AgentOutcome> {
+	async fn run(&self, req: AgentRequest, handler: &mut dyn RunHandler) -> Result<AgentOutcome> {
 		let started = std::time::Instant::now();
 		let prompt = match &req.session_id {
 			Some(_) => events::resume_prompt(&req.messages)

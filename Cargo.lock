@@ -678,16 +678,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "letsharness-agent-loop"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "letsharness-kernel",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "letsharness-kernel"
 version = "0.1.0"
 dependencies = [

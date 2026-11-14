@@ -1,16 +1,17 @@
-//! `agent` サブコマンド: ツールを使いながら最終回答まで自走する。
+//! `loop` / `agent` サブコマンドの実行: ツールを使いながら最終回答まで進める。
 //!
 //! 途中経過 (ツール呼び出し・結果・承認の確認) はすべて stderr、最終回答だけが stdout。
 
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use letsharness_kernel::{self as llm, AgentBackend, ChatMessage};
+use letsharness_kernel::{self as llm, AgentBackend, ChatMessage, Host};
+use serde_json::Value;
 
 use crate::format_usage;
 
 pub struct Options {
-	/// 空ならバックエンドの既定モデル。
+	/// 空ならバックエンドの既定モデル (`loop` では必須)。
 	pub model: String,
 	pub prompt: String,
 	pub system: Option<String>,
@@ -20,25 +21,60 @@ pub struct Options {
 	pub yes: bool,
 	pub no_thinking: bool,
 	pub show_usage: bool,
-	/// 外部エージェントの会話 ID。
+	/// 外部エージェントの会話 ID (`agent` のみ)。
 	pub resume: Option<String>,
 }
 
-pub async fn run(backend: Arc<dyn AgentBackend>, opts: Options) -> Result<()> {
-	let mut messages = Vec::new();
-	if let Some(s) = opts.system {
-		messages.push(ChatMessage::system(s));
+impl Options {
+	fn messages(&self) -> Vec<ChatMessage> {
+		let mut messages = Vec::new();
+		if let Some(s) = &self.system {
+			messages.push(ChatMessage::system(s));
+		}
+		messages.push(ChatMessage::user(&self.prompt));
+		messages
 	}
-	messages.push(ChatMessage::user(opts.prompt));
-	let mut req = llm::AgentRequest::new(opts.model, messages);
+
+	fn approval(&self) -> llm::ApprovalPolicy {
+		if self.yes {
+			llm::ApprovalPolicy::AutoApprove
+		} else {
+			llm::ApprovalPolicy::Ask
+		}
+	}
+}
+
+/// kernel のループを回す (`--provider` のモデル + ツール)。
+pub async fn run_loop(host: &Host, provider: &str, cfg: &Value, opts: Options) -> Result<()> {
+	if opts.model.is_empty() {
+		bail!("loop には --model が必要です");
+	}
+	let mut req = llm::LoopRequest::new(opts.model.clone(), opts.messages());
 	req.max_tokens = opts.max_tokens;
 	req.max_steps = opts.max_steps;
-	req.session_id = opts.resume;
-	req.approval = if opts.yes {
-		llm::ApprovalPolicy::AutoApprove
-	} else {
-		llm::ApprovalPolicy::Ask
+	req.approval = opts.approval();
+	let mut handler = CliHandler {
+		no_thinking: opts.no_thinking,
 	};
+
+	let out = host.run_loop(provider, cfg, req, &mut handler).await?;
+	report(
+		&opts,
+		&out.text,
+		out.usage.as_ref(),
+		out.steps,
+		None,
+		out.hit_step_limit,
+	)
+}
+
+/// 外部エージェントに丸ごと任せる。
+pub async fn run_agent(backend: Arc<dyn AgentBackend>, opts: Options) -> Result<()> {
+	let mut req = llm::AgentRequest::new(opts.model.clone(), opts.messages());
+	req.max_tokens = opts.max_tokens;
+	req.max_steps = opts.max_steps;
+	req.session_id = opts.resume.clone();
+	req.approval = opts.approval();
 	if !backend.asks_approval() && !opts.yes {
 		eprintln!(
 			"(注: {name} はツール実行の承認をこちらに求めません。{name} 側の権限設定で許可されていない操作は却下されます。全許可は --yes)",
@@ -50,18 +86,36 @@ pub async fn run(backend: Arc<dyn AgentBackend>, opts: Options) -> Result<()> {
 	};
 
 	let out = backend.run(req, &mut handler).await?;
-	// 最終回答だけを stdout へ (途中経過は stderr なのでパイプ可能)。
-	println!("{}", out.text);
+	report(
+		&opts,
+		&out.text,
+		out.usage.as_ref(),
+		out.steps,
+		out.session_id.as_deref(),
+		out.hit_step_limit,
+	)
+}
+
+/// 最終回答だけを stdout へ (途中経過は stderr なのでパイプ可能)。
+fn report(
+	opts: &Options,
+	text: &str,
+	usage: Option<&llm::Usage>,
+	steps: usize,
+	session_id: Option<&str>,
+	hit_step_limit: bool,
+) -> Result<()> {
+	println!("{text}");
 	if opts.show_usage {
-		match &out.usage {
-			Some(u) => eprintln!("{} steps={}", format_usage(u), out.steps),
-			None => eprintln!("usage: (none) steps={}", out.steps),
+		match usage {
+			Some(u) => eprintln!("{} steps={steps}", format_usage(u)),
+			None => eprintln!("usage: (none) steps={steps}"),
 		}
 	}
-	if let Some(id) = &out.session_id {
+	if let Some(id) = session_id {
 		eprintln!("session: {id} (--resume {id} で続きから)");
 	}
-	if out.hit_step_limit {
+	if hit_step_limit {
 		bail!(
 			"--max-steps={} に達したため打ち切りました (タスクは未完了の可能性があります)",
 			opts.max_steps
@@ -121,7 +175,7 @@ fn format_result(content: &str) -> String {
 }
 
 #[async_trait::async_trait]
-impl llm::AgentHandler for CliHandler {
+impl llm::RunHandler for CliHandler {
 	fn on_text(&mut self, text: &str) {
 		eprintln!("{text}");
 	}

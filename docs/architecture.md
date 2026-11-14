@@ -2,7 +2,7 @@
 
 LetsHarness は「可能な限りすべてをプラグインにする」マイクロカーネル構成を取る。
 kernel は「プラグインを発見して使う」ことだけを持ち、プロバイダ・ツール・エージェント・`.env` 読み込みなどはすべて別プロセスのプラグインとして載る。
-`letsharness` は Client で、kernel を動かして `Host` に頼むだけ。どのプラグインがあるかは Client も kernel の実装も知らず、実行時に発見される。
+`letsharness` は Client で、kernel を動かして `Host` に頼むだけ。モデルとツールでループを回すのは kernel の責務 (`run_loop`) で、Agent とは呼ばない。どのプラグインがあるかは Client も kernel の実装も知らず、実行時に発見される。
 
 - 全体図: [Diagrams / Plugin architecture](#plugin-architecture)
 - Provider 拡張点とデータ設計: [Diagrams / Provider](#provider)
@@ -11,10 +11,10 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 
 | Layer | 役割 | 依存してよいもの |
 | --- | --- | --- |
-| `kernel` | プラグインの発見・起動・通信 (`Kernel::boot` → `Host`)、共有型、拡張点 trait、プラグイン側の `PluginServer` | serde, tokio, toml (UI・HTTP ライブラリには依存しない) |
+| `kernel` | プラグインの発見・起動・通信 (`Kernel::boot` → `Host`)、ループ (`run_loop`)、共有型、拡張点 trait、プラグイン側の `PluginServer` | serde, tokio, toml (UI・HTTP ライブラリには依存しない) |
 | `letsharness` (Client) | CLI。`Kernel::boot` で kernel を動かし、`Host` に `kind` 名で頼む | **kernel のみ** (+ clap 等) |
 | `provider-*` | 各社 API の実装。`bin` + `plugin.toml` | kernel (+ reqwest 等) |
-| `agent-*` | `AgentBackend` の実装。`bin` + `plugin.toml` (例: ループを回す `agent-loop`、外部 CLI を包む `agent-antigravity`) | kernel (+ tokio::process 等) |
+| `agent-*` | 外部エージェント (自分でループもツールも持つもの) を `AgentBackend` として包む。`bin` + `plugin.toml` (例: `agent-antigravity`) | kernel (+ tokio::process 等) |
 | `tool-*` | エージェントが呼ぶツール。`bin` + `plugin.toml` (例: `tool-local`) | kernel |
 | `plugin-*` | 起動時フックなど。`bin` + `plugin.toml` (例: `plugin-dotenv`) | kernel |
 
@@ -39,17 +39,17 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | 拡張点 | プラグインが実装する trait | Client から見える形 | 用途 |
 | --- | --- | --- | --- |
 | `provider` | `ProviderFactory` → `Provider` | `Host::provider(kind, cfg)` → `Arc<dyn Provider>` | LLM API。`create(cfg: Value)` でインスタンス化 |
-| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | 依頼を受けて最終回答まで自走するもの。途中経過と承認はプロセス間で往復する。`Provider` とは「ループを誰が回すか」で分かれる |
+| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | ループもツールも自分で持って最終回答まで自走する外部エージェント。途中経過と承認はプロセス間で往復する |
 | `tool` | `ToolFactory` → `Tool` | `Host::tools(cfg)` → `ToolRegistry` | エージェントが呼ぶツール。スキーマは MCP と同形 |
 | `boot` | `BootHook` | (Kernel が起動時に呼ぶ) | 返した環境変数が、以降に起動するプラグインの環境に足される |
 
-`Provider` (1回の呼び出しがモデル1回) と `AgentBackend` (ループを相手が回す) は別の拡張点のまま。
-特別扱いする「組み込み」は無く、ループ型の `agent-loop` も他と同じ agent プラグイン。モデルとツールは自前で持たず、実行中だけ kernel に借りる:
+## Provider / Loop / Agent
 
-- `agent-loop` は `AgentHandler::host()` (`HostApi`) で `provider(kind, cfg)` / `tools(cfg)` を頼む。実体は plugin → kernel の `host.*` リクエスト。
-- kernel は自分の `Host` で引いて貸すだけ。プラグイン同士は互いを知らず、kernel が中継する。
-- 借りた Provider はエージェントが使う非ストリームの呼び出しのみ (ストリームは `Unsupported`)。
-`Hook` と `CliCommand` は未実装。
+- **Provider**: モデルを1回呼ぶだけ。履歴もツール実行も持たない。
+- **Loop**: モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答まで繰り返す。**kernel の責務** (`run_loop`、`Host::run_loop`)。使う `Provider` と `Tool` は `Host` が引いたもので、どのプラグインのものかは知らない。承認と途中経過は `RunHandler` で Client に委ねる。
+- **Agent**: ループもツールも相手が持っていて、こちらは依頼を渡して結果と途中経過を受け取るだけのもの (Antigravity CLI など)。`AgentBackend` の拡張点。
+
+Loop は Agent ではないので、プラグインにはしない。Client は `loop` (Loop) と `agent` (外部エージェント。`--backend` で kind を選ぶ) を別のコマンドとして持つ。
 
 ## Writing a plugin
 
@@ -105,7 +105,7 @@ path = "~/.letsharness/plugins/openai-compat"
   - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。
   - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。承認のようなプラグインから kernel への問い合わせも、同じ `req` を持つリクエスト。
   - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call`。
-  - プラグイン → kernel (`agent.run` の最中のみ): `agent.approve` / `host.provider.create` / `host.provider.call` / `host.tools.create` / `host.tool.call`。
+  - プラグイン → kernel (`agent.run` の最中のみ): `agent.approve`。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
 - Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。
@@ -115,7 +115,7 @@ path = "~/.letsharness/plugins/openai-compat"
 1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。設定ファイル (`default_provider` / `[providers.x]`) を導入する。いまの `Provider` は多数のメソッドを持ち、そのまま線の上を流れている。
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
 3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response) を効かせる。
-4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、ループ型エージェント (`crates/agent-loop`、`--backend loop`)、外部エージェント `crates/agent-antigravity` (`--backend antigravity`) は実装済み。
+4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) は実装済み。
 5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
 
@@ -146,6 +146,7 @@ classDiagram
     +provider(kind, cfg) Arc~dyn Provider~
     +agent_backend(kind, cfg) Arc~dyn AgentBackend~
     +tools(cfg) ToolRegistry
+    +run_loop(provider, cfg, req, handler) LoopOutcome
     +has_agent_backend(kind) bool
   }
   class Manifest {
@@ -209,7 +210,6 @@ classDiagram
   class ProviderGemini
   class ProviderMock
   class AgentAntigravity
-  class AgentLoop
   class ToolLocal
   class PluginDotenv
 
@@ -241,9 +241,7 @@ classDiagram
   ProviderFactory <|.. ProviderGemini
   ProviderFactory <|.. ProviderMock
   AgentBackendFactory <|.. AgentAntigravity
-  AgentBackendFactory <|.. AgentLoop
   ToolFactory <|.. ToolLocal
-  AgentLoop ..> Host : モデルとツールを借りる (kernel が中継)
   BootHook <|.. PluginDotenv
 
   note for Client "kernel にしか依存しない\nプラグインの列挙もリンクもしない"

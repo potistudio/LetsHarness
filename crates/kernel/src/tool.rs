@@ -27,7 +27,7 @@ pub struct ToolSpec {
 	/// 引数の JSON Schema (`{"type":"object","properties":{...}}`)。
 	pub input_schema: serde_json::Value,
 
-	/// `true` なら実行前に [`AgentHandler::approve`](crate::AgentHandler::approve) で承認を取る。
+	/// `true` なら実行前に [`RunHandler::approve`](crate::RunHandler::approve) で承認を取る。
 	/// 副作用のあるツール (書き込み・コマンド実行など) は立てる。
 	#[serde(default)]
 	pub requires_approval: bool,

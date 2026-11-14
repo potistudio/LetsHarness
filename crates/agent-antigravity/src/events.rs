@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use letsharness_kernel::{AgentHandler, ChatMessage, ToolCall, ToolOutput, Usage};
+use letsharness_kernel::{ChatMessage, RunHandler, ToolCall, ToolOutput, Usage};
 
 // -----------------------------------------------------------------------------
 // 入力: プロンプト
@@ -252,10 +252,10 @@ pub(crate) fn parse_line(line: &str) -> Option<Event> {
 }
 
 // -----------------------------------------------------------------------------
-// ステップ列 -> AgentHandler
+// ステップ列 -> RunHandler
 // -----------------------------------------------------------------------------
 
-/// `step_update` の列を [`AgentHandler`] の通知に変換する。
+/// `step_update` の列を [`RunHandler`] の通知に変換する。
 ///
 /// 組み込みループと同じ意味になるよう揃える:
 /// - 思考ステップは完了時にまとめて `on_thinking`。
@@ -275,7 +275,7 @@ pub(crate) struct StepTracker {
 }
 
 impl StepTracker {
-	pub fn on_step(&mut self, step: Step, h: &mut dyn AgentHandler) {
+	pub fn on_step(&mut self, step: Step, h: &mut dyn RunHandler) {
 		if self.open.as_ref().is_some_and(|(i, ..)| *i != step.index) {
 			self.close_open(h);
 		}
@@ -318,7 +318,7 @@ impl StepTracker {
 		}
 	}
 
-	fn close_open(&mut self, h: &mut dyn AgentHandler) {
+	fn close_open(&mut self, h: &mut dyn RunHandler) {
 		let Some((_, thinking, text)) = self.open.take() else {
 			return;
 		};
@@ -335,7 +335,7 @@ impl StepTracker {
 	}
 
 	/// 残りを流し切り、ストリームから組み立てた最終回答とツールステップ数を返す。
-	pub fn finish(mut self, h: &mut dyn AgentHandler) -> (String, usize) {
+	pub fn finish(mut self, h: &mut dyn RunHandler) -> (String, usize) {
 		self.close_open(h);
 		// 完了が届かなかったツールも結果待ちのまま放置しない。
 		for call in std::mem::take(&mut self.tools).into_values() {
@@ -477,7 +477,7 @@ mod tests {
 	struct Rec(Vec<String>);
 
 	#[async_trait::async_trait]
-	impl AgentHandler for Rec {
+	impl RunHandler for Rec {
 		fn on_text(&mut self, t: &str) {
 			self.0.push(format!("text:{t}"));
 		}

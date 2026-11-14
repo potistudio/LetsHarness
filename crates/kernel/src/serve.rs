@@ -13,17 +13,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::dispatch::{call_provider, field, to_value};
 use crate::rpc::{Frame, WireError};
-use crate::{
-	AgentBackend, AgentHandler, AgentRequest, ChatMessage, ChatOutput, Completion, Error, HostApi, ModelInfo, Provider,
-	Quota, Result, Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec,
-};
+use crate::{AgentBackend, AgentRequest, Error, Provider, Result, RunHandler, Tool, ToolCall, ToolOutput, ToolSpec};
 
 // ---------------------------------------------------------------------------
 // プラグインが実装する拡張点
@@ -271,10 +267,6 @@ impl Inner {
 				let mut handler = RpcHandler {
 					inner: self.clone(),
 					req,
-					link: KernelLink {
-						inner: self.clone(),
-						req,
-					},
 				};
 				to_value(agent.run(request, &mut handler).await?)
 			}
@@ -310,15 +302,14 @@ impl Inner {
 	}
 }
 
-/// エージェントの途中経過を Kernel へ通知し、承認とモデル・ツールの借用は Kernel に問い合わせる。
+/// エージェントの途中経過を Kernel へ通知し、承認は Kernel に問い合わせる。
 struct RpcHandler {
 	inner: Arc<Inner>,
 	req: u64,
-	link: KernelLink,
 }
 
 #[async_trait::async_trait]
-impl AgentHandler for RpcHandler {
+impl RunHandler for RpcHandler {
 	fn on_text(&mut self, text: &str) {
 		self.inner.notify("agent.on_text", self.req, json!({ "text": text }));
 	}
@@ -347,216 +338,5 @@ impl AgentHandler for RpcHandler {
 			.ask("agent.approve", self.req, json!({ "call": call, "spec": spec }))
 			.await;
 		answer.ok().and_then(|v| v.as_bool()).unwrap_or(false)
-	}
-
-	fn host(&self) -> Option<&dyn HostApi> {
-		Some(&self.link)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Kernel から借りる Provider / Tool
-// ---------------------------------------------------------------------------
-
-/// 実行中の `agent.run` の中から、kernel に頼む窓口。
-#[derive(Clone)]
-struct KernelLink {
-	inner: Arc<Inner>,
-	req: u64,
-}
-
-#[async_trait::async_trait]
-impl HostApi for KernelLink {
-	async fn provider(&self, kind: &str, cfg: &Value) -> Result<Arc<dyn Provider>> {
-		let created = self
-			.inner
-			.ask("host.provider.create", self.req, json!({ "kind": kind, "cfg": cfg }))
-			.await?;
-		let instance: u64 = field(&created, "instance")?;
-		let name = created.get("name").and_then(Value::as_str).unwrap_or(kind);
-		Ok(Arc::new(KernelProvider {
-			link: self.clone(),
-			instance,
-			name: Box::leak(name.to_owned().into_boxed_str()),
-		}))
-	}
-
-	async fn tools(&self, cfg: &Value) -> Result<ToolRegistry> {
-		let created = self
-			.inner
-			.ask("host.tools.create", self.req, json!({ "cfg": cfg }))
-			.await?;
-		let list: Vec<KernelToolInfo> = field(&created, "tools")?;
-		let mut tools = ToolRegistry::new();
-		for info in list {
-			tools.add(Arc::new(KernelTool {
-				link: self.clone(),
-				id: info.id,
-				spec: info.spec,
-			}));
-		}
-		Ok(tools)
-	}
-}
-
-#[derive(serde::Deserialize)]
-struct KernelToolInfo {
-	id: u64,
-	spec: ToolSpec,
-}
-
-/// kernel が持つ Provider を線越しに使う。エージェントループが使う非ストリームの呼び出しだけを通し、
-/// ストリームは `Unsupported`。
-struct KernelProvider {
-	link: KernelLink,
-	instance: u64,
-	name: &'static str,
-}
-
-impl KernelProvider {
-	async fn rpc<R: DeserializeOwned>(&self, method: &str, mut params: Value) -> Result<R> {
-		params["instance"] = self.instance.into();
-		params["method"] = method.into();
-		let v = self.link.inner.ask("host.provider.call", self.link.req, params).await?;
-		serde_json::from_value(v).map_err(|e| Error::plugin("kernel", e))
-	}
-}
-
-#[async_trait::async_trait]
-impl Provider for KernelProvider {
-	fn name(&self) -> &'static str {
-		self.name
-	}
-
-	async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-		self.rpc("list_models", json!({})).await
-	}
-
-	async fn chat(&self, model: &str, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<String> {
-		self.rpc(
-			"chat",
-			json!({ "model": model, "messages": messages, "max_tokens": max_tokens }),
-		)
-		.await
-	}
-
-	async fn chat_stream(
-		&self,
-		_model: &str,
-		_messages: Vec<ChatMessage>,
-		_on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		_on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<String> {
-		Err(Error::Unsupported("chat_stream (kernel 経由の借用では非対応)".into()))
-	}
-
-	async fn responses(&self, model: &str, input: &str) -> Result<String> {
-		self.rpc("responses", json!({ "model": model, "input": input })).await
-	}
-
-	async fn messages(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<String> {
-		self.rpc(
-			"messages",
-			json!({ "model": model, "messages": messages, "system": system, "max_tokens": max_tokens }),
-		)
-		.await
-	}
-
-	async fn quota(&self) -> Result<Quota> {
-		self.rpc("quota", json!({})).await
-	}
-
-	async fn chat_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		max_tokens: Option<u32>,
-	) -> Result<ChatOutput> {
-		self.rpc(
-			"chat_with_usage",
-			json!({ "model": model, "messages": messages, "max_tokens": max_tokens }),
-		)
-		.await
-	}
-
-	async fn chat_stream_with_usage(
-		&self,
-		_model: &str,
-		_messages: Vec<ChatMessage>,
-		_on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		_on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<ChatOutput> {
-		Err(Error::Unsupported(
-			"chat_stream_with_usage (kernel 経由の借用では非対応)".into(),
-		))
-	}
-
-	async fn chat_with_tools(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		tools: &[ToolSpec],
-		max_tokens: Option<u32>,
-	) -> Result<Completion> {
-		self.rpc(
-			"chat_with_tools",
-			json!({ "model": model, "messages": messages, "tools": tools, "max_tokens": max_tokens }),
-		)
-		.await
-	}
-
-	async fn responses_with_usage(&self, model: &str, input: &str) -> Result<ChatOutput> {
-		self.rpc("responses_with_usage", json!({ "model": model, "input": input }))
-			.await
-	}
-
-	async fn messages_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<ChatOutput> {
-		self.rpc(
-			"messages_with_usage",
-			json!({ "model": model, "messages": messages, "system": system, "max_tokens": max_tokens }),
-		)
-		.await
-	}
-}
-
-/// kernel が持つツールを線越しに使う。
-struct KernelTool {
-	link: KernelLink,
-	id: u64,
-	spec: ToolSpec,
-}
-
-#[async_trait::async_trait]
-impl Tool for KernelTool {
-	fn spec(&self) -> ToolSpec {
-		self.spec.clone()
-	}
-
-	async fn call(&self, args: Value) -> ToolOutput {
-		let answer = self
-			.link
-			.inner
-			.ask(
-				"host.tool.call",
-				self.link.req,
-				json!({ "tool": self.id, "args": args }),
-			)
-			.await;
-		match answer.and_then(|v| serde_json::from_value(v).map_err(|e| Error::plugin("kernel", e))) {
-			Ok(output) => output,
-			Err(e) => ToolOutput::error(e.to_string()),
-		}
 	}
 }
