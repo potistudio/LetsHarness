@@ -38,6 +38,15 @@ cargo build --workspace --release
 cargo run --release -- --provider mock chat --model m --prompt hi
 ```
 
+To use the Claude-like desktop GUI instead of the CLI:
+
+```bash
+cargo run --release -p letsharness-gui
+```
+
+Pick the provider and model from the composer. `-o KEY=VALUE` is passed to the kernel and providers as with the CLI
+(e.g. `cargo run -p letsharness-gui -- -o env_file=.env`).
+
 In this repository `.cargo/config.toml` points `LETSHARNESS_PLUGIN_PATH` at `crates/`, so each `crates/*/plugin.toml` is found as is.
 See [docs/architecture.md](docs/architecture.md) for how plugins are discovered and written.
 
