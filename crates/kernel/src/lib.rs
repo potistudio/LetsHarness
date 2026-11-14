@@ -21,7 +21,7 @@ mod tool;
 
 pub use agent::{AgentBackend, AgentOutcome, AgentRequest};
 pub use external::{Contributes, MANIFEST_FILE, Manifest};
-pub use handler::{ApprovalPolicy, DEFAULT_MAX_STEPS, RunHandler};
+pub use handler::{DEFAULT_MAX_STEPS, RunHandler};
 pub use host::Host;
 pub use kernel::{BootConfig, Kernel};
 pub use run_loop::{LoopOutcome, LoopRequest, run_loop};

@@ -476,7 +476,6 @@ mod tests {
 	#[derive(Default)]
 	struct Rec(Vec<String>);
 
-	#[async_trait::async_trait]
 	impl RunHandler for Rec {
 		fn on_text(&mut self, t: &str) {
 			self.0.push(format!("text:{t}"));

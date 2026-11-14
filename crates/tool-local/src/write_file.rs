@@ -27,7 +27,6 @@ impl Tool for WriteFile {
 				"content": {"type": "string", "description": "書き込む全文"},
 			}),
 			&["path", "content"],
-			true,
 		)
 	}
 

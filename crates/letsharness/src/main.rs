@@ -108,8 +108,8 @@ enum Cmd {
 	},
 	/// --provider のモデルとツールでループを回し、最終回答まで進める (非ストリーム)
 	///
-	/// ツールは read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
-	/// 承認は実行ごとに stderr で確認する。`--yes` で全承認 (bash は何でも実行できるので注意)。
+	/// ツールは read_file / list_dir / write_file / edit_file / bash を確認なしで実行する
+	/// (bash は何でも実行できるので注意)。
 	Loop {
 		#[arg(long)]
 		model: String,
@@ -125,9 +125,6 @@ enum Cmd {
 		/// ツールの作業ディレクトリ。ファイル系ツールはこの外に出られない
 		#[arg(long, default_value = ".")]
 		workdir: std::path::PathBuf,
-		/// 承認が必要なツールを確認なしで実行する
-		#[arg(long, default_value_t = false)]
-		yes: bool,
 		/// 思考過程を表示しない
 		#[arg(long, default_value_t = false)]
 		no_thinking: bool,
@@ -137,8 +134,8 @@ enum Cmd {
 	},
 	/// 外部エージェント (--backend) に最終回答まで丸ごと任せる (非ストリーム)
 	///
-	/// 例: --backend antigravity は agy が自分のツールで動く。承認はこちらに求められず、
-	/// agy の権限設定で許可されていない操作は却下される (`--yes` で全許可)。
+	/// 例: --backend antigravity は agy が自分のツールで動く。権限は agy 側の設定に従う (全許可も agy 側で設定する)。
+	/// 権限の扱いはエージェントごとに異なり、LetsHarness からは切り替えない。
 	Agent {
 		/// 省略するとエージェントの既定モデル
 		#[arg(long)]
@@ -155,9 +152,6 @@ enum Cmd {
 		/// ツールの作業ディレクトリ。ファイル系ツールはこの外に出られない
 		#[arg(long, default_value = ".")]
 		workdir: std::path::PathBuf,
-		/// 承認が必要なツールを確認なしで実行する
-		#[arg(long, default_value_t = false)]
-		yes: bool,
 		/// 思考過程を表示しない
 		#[arg(long, default_value_t = false)]
 		no_thinking: bool,
@@ -294,7 +288,6 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			max_tokens,
 			max_steps,
 			workdir,
-			yes,
 			no_thinking,
 			show_usage,
 		} => {
@@ -312,7 +305,6 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 					system,
 					max_tokens,
 					max_steps,
-					yes,
 					no_thinking,
 					show_usage,
 					resume: None,
@@ -327,7 +319,6 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			max_tokens,
 			max_steps,
 			workdir,
-			yes,
 			no_thinking,
 			show_usage,
 			resume,
@@ -347,7 +338,6 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 					system,
 					max_tokens,
 					max_steps,
-					yes,
 					no_thinking,
 					show_usage,
 					resume,

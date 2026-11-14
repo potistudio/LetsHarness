@@ -142,7 +142,6 @@ fn kernel_loop_runs_external_provider_and_external_tools() {
 		r#"tool:write_file {"path":"a.txt","content":"from tool"}"#,
 		"--workdir",
 		dir.to_str().unwrap(),
-		"--yes",
 	]);
 	assert!(out.status.success(), "{}", stderr(&out));
 	assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "from tool");
@@ -210,26 +209,4 @@ fn agent_needs_an_explicit_backend() {
 		"{}",
 		stderr(&out)
 	);
-}
-
-#[test]
-fn loop_asks_before_running_tools_that_need_approval() {
-	let dir = std::env::temp_dir().join(format!("lh-e2e-ask-{}", std::process::id()));
-	std::fs::create_dir_all(&dir).unwrap();
-	// 非対話 (stdin が空) の承認は拒否になる。
-	let out = letsharness(&[
-		"--provider",
-		"mock",
-		"loop",
-		"--model",
-		"m",
-		"--prompt",
-		r#"tool:write_file {"path":"a.txt","content":"x"}"#,
-		"--workdir",
-		dir.to_str().unwrap(),
-	]);
-	assert!(out.status.success(), "{}", stderr(&out));
-	assert!(!dir.join("a.txt").exists());
-	assert!(stdout(&out).contains("denied"), "{}", stdout(&out));
-	std::fs::remove_dir_all(&dir).unwrap();
 }

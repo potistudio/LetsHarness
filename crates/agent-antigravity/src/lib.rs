@@ -4,17 +4,16 @@
 //!
 //! - 一覧 : `agy models`
 //! - 実行 : `agy -p <prompt> --output-format stream-json --disable-slash-commands
-//!   [--model <m>] [--conversation <id>] [--dangerously-skip-permissions]`
+//!   [--model <m>] [--conversation <id>]`
 //!
 //! agy はモデルではなくエージェント: ループ・ツール・会話履歴を自分で持つ。
 //! そのため [`Provider`](letsharness_kernel::Provider) ではなく [`AgentBackend`] として載せる。
 //! 認証・クォータも agy 側 (Google アカウント / `~/.gemini/antigravity-cli/`) に任せ、HTTP は叩かない。
 //!
 //! kernel の契約との対応:
-//! - ツールは agy のもの。ハンドラには実行の通知 (`on_tool_call` / `on_tool_result`) だけが届き、
-//!   `approve` は呼ばれない ([`AgentBackend::asks_approval`] = `false`)。
-//!   [`ApprovalPolicy::AutoApprove`] は `--dangerously-skip-permissions` に、
-//!   [`ApprovalPolicy::Ask`] は agy の権限設定 (未許可のものはヘッドレスで自動却下) に対応する。
+//! - ツールは agy のもの。ハンドラには実行の通知 (`on_tool_call` / `on_tool_result`) だけが届く。
+//!   権限は agy の設定に従う (未許可のものはヘッドレスで自動却下される)。
+//!   全許可にしたいときは agy 側の権限設定で行う (LetsHarness からは切り替えない)。
 //! - system プロンプト・履歴を渡す口が無いので1つのプロンプトに畳む ([`events::render_prompt`])。
 //!   `session_id` 指定時は agy が履歴を持つので最後の依頼だけを送る。
 //! - `max_tokens` / `max_steps` は指定できない (無視する)。
@@ -31,9 +30,7 @@ use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use letsharness_kernel::{
-	AgentBackend, AgentOutcome, AgentRequest, ApprovalPolicy, ChatMessage, Error, ModelInfo, Result, RunHandler,
-};
+use letsharness_kernel::{AgentBackend, AgentOutcome, AgentRequest, ChatMessage, Error, ModelInfo, Result, RunHandler};
 
 use crate::events::{Event, RunResult, StepTracker};
 
@@ -175,10 +172,6 @@ impl AgentBackend for AntigravityAgent {
 		PLUGIN
 	}
 
-	fn asks_approval(&self) -> bool {
-		false
-	}
-
 	async fn list_models(&self) -> Result<Vec<ModelInfo>> {
 		let out = self
 			.command()
@@ -219,9 +212,6 @@ impl AgentBackend for AntigravityAgent {
 		}
 		if let Some(id) = &req.session_id {
 			cmd.arg("--conversation").arg(id);
-		}
-		if req.approval == ApprovalPolicy::AutoApprove {
-			cmd.arg("--dangerously-skip-permissions");
 		}
 		cmd.args(["--output-format", "stream-json", "--disable-slash-commands", "-p"])
 			.arg(prompt);

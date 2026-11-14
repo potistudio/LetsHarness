@@ -30,29 +30,6 @@ impl Drop for TempRoot {
 	}
 }
 
-#[test]
-fn only_side_effecting_tools_need_approval() {
-	let t = TempRoot::new("spec");
-	let mut flags: Vec<_> = local_tools(&t.0)
-		.iter()
-		.map(|t| {
-			let s = t.spec();
-			(s.name, s.requires_approval)
-		})
-		.collect();
-	flags.sort();
-	assert_eq!(
-		flags,
-		[
-			("bash".to_string(), true),
-			("edit_file".to_string(), true),
-			("list_dir".to_string(), false),
-			("read_file".to_string(), false),
-			("write_file".to_string(), true),
-		]
-	);
-}
-
 #[tokio::test]
 async fn write_read_edit_roundtrip() {
 	let t = TempRoot::new("rw");

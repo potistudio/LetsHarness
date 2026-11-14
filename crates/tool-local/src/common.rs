@@ -8,13 +8,7 @@ pub(crate) fn parse_args<T: for<'de> Deserialize<'de>>(args: serde_json::Value) 
 	serde_json::from_value(args).map_err(|e| ToolOutput::error(format!("invalid arguments: {e}")))
 }
 
-pub(crate) fn spec(
-	name: &str,
-	description: &str,
-	properties: serde_json::Value,
-	required: &[&str],
-	approval: bool,
-) -> ToolSpec {
+pub(crate) fn spec(name: &str, description: &str, properties: serde_json::Value, required: &[&str]) -> ToolSpec {
 	ToolSpec {
 		name: name.into(),
 		description: description.into(),
@@ -23,6 +17,5 @@ pub(crate) fn spec(
 			"properties": properties,
 			"required": required,
 		}),
-		requires_approval: approval,
 	}
 }

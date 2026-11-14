@@ -308,7 +308,6 @@ mod tests {
 			name: "read_file".into(),
 			description: "read".into(),
 			input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
-			requires_approval: false,
 		}]
 	}
 

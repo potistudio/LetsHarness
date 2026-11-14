@@ -39,14 +39,14 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | 拡張点 | プラグインが実装する trait | Client から見える形 | 用途 |
 | --- | --- | --- | --- |
 | `provider` | `ProviderFactory` → `Provider` | `Host::provider(kind, cfg)` → `Arc<dyn Provider>` | LLM API。`create(cfg: Value)` でインスタンス化 |
-| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | ループもツールも自分で持って最終回答まで自走する外部エージェント。途中経過と承認はプロセス間で往復する |
+| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | ループもツールも自分で持って最終回答まで自走する外部エージェント。途中経過はプロセス間で通知として流れる |
 | `tool` | `ToolFactory` → `Tool` | `Host::tools(cfg)` → `ToolRegistry` | エージェントが呼ぶツール。スキーマは MCP と同形 |
 | `boot` | `BootHook` | (Kernel が起動時に呼ぶ) | 返した環境変数が、以降に起動するプラグインの環境に足される |
 
 ## Provider / Loop / Agent
 
 - **Provider**: モデルを1回呼ぶだけ。履歴もツール実行も持たない。
-- **Loop**: モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答まで繰り返す。**kernel の責務** (`run_loop`、`Host::run_loop`)。使う `Provider` と `Tool` は `Host` が引いたもので、どのプラグインのものかは知らない。承認と途中経過は `RunHandler` で Client に委ねる。
+- **Loop**: モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答まで繰り返す。**kernel の責務** (`run_loop`、`Host::run_loop`)。使う `Provider` と `Tool` は `Host` が引いたもので、どのプラグインのものかは知らない。途中経過は `RunHandler` で Client に委ねる。ツールは承認なしで実行される (`bash` は cwd を決めるだけで何でも実行できるので、信頼できない入力には使わない)。
 - **Agent**: ループもツールも相手が持っていて、こちらは依頼を渡して結果と途中経過を受け取るだけのもの (Antigravity CLI など)。`AgentBackend` の拡張点。
 
 Loop は Agent ではないので、プラグインにはしない。Client は `loop` (Loop) と `agent` (外部エージェント。`--backend` で kind を選ぶ) を別のコマンドとして持つ。
@@ -103,9 +103,10 @@ path = "~/.letsharness/plugins/openai-compat"
 - すべてのプラグインは別プロセス。Rust の ABI で dylib を読み込むことはしない。プラグインがクラッシュしても kernel は巻き込まれない。
 - 運ぶ手段は **stdio (1行1メッセージの JSON-RPC 風)**。メッセージは `crates/kernel/src/rpc.rs`。
   - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。
-  - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。承認のようなプラグインから kernel への問い合わせも、同じ `req` を持つリクエスト。
+  - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。プラグインから kernel への問い合わせは、同じ `req` を持つリクエストとして扱う (プロトコル上の予約で、現在 `PluginServer` に送る API は無い)。
+  - 型の後方互換は保証しない。プラグインと kernel は同じバージョンでビルドする。
   - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call`。
-  - プラグイン → kernel (`agent.run` の最中のみ): `agent.approve`。
+  - プラグイン → kernel: 現在は無い。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
 - Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。

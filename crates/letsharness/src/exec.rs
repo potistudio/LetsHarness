@@ -1,6 +1,6 @@
 //! `loop` / `agent` サブコマンドの実行: ツールを使いながら最終回答まで進める。
 //!
-//! 途中経過 (ツール呼び出し・結果・承認の確認) はすべて stderr、最終回答だけが stdout。
+//! 途中経過 (ツール呼び出し・結果) はすべて stderr、最終回答だけが stdout。
 
 use std::sync::Arc;
 
@@ -17,8 +17,6 @@ pub struct Options {
 	pub system: Option<String>,
 	pub max_tokens: Option<u32>,
 	pub max_steps: usize,
-	/// 承認が必要なツールを確認なしで実行する。
-	pub yes: bool,
 	pub no_thinking: bool,
 	pub show_usage: bool,
 	/// 外部エージェントの会話 ID (`agent` のみ)。
@@ -34,14 +32,6 @@ impl Options {
 		messages.push(ChatMessage::user(&self.prompt));
 		messages
 	}
-
-	fn approval(&self) -> llm::ApprovalPolicy {
-		if self.yes {
-			llm::ApprovalPolicy::AutoApprove
-		} else {
-			llm::ApprovalPolicy::Ask
-		}
-	}
 }
 
 /// kernel のループを回す (`--provider` のモデル + ツール)。
@@ -52,7 +42,6 @@ pub async fn run_loop(host: &Host, provider: &str, cfg: &Value, opts: Options) -
 	let mut req = llm::LoopRequest::new(opts.model.clone(), opts.messages());
 	req.max_tokens = opts.max_tokens;
 	req.max_steps = opts.max_steps;
-	req.approval = opts.approval();
 	let mut handler = CliHandler {
 		no_thinking: opts.no_thinking,
 	};
@@ -74,13 +63,6 @@ pub async fn run_agent(backend: Arc<dyn AgentBackend>, opts: Options) -> Result<
 	req.max_tokens = opts.max_tokens;
 	req.max_steps = opts.max_steps;
 	req.session_id = opts.resume.clone();
-	req.approval = opts.approval();
-	if !backend.asks_approval() && !opts.yes {
-		eprintln!(
-			"(注: {name} はツール実行の承認をこちらに求めません。{name} 側の権限設定で許可されていない操作は却下されます。全許可は --yes)",
-			name = backend.name()
-		);
-	}
 	let mut handler = CliHandler {
 		no_thinking: opts.no_thinking,
 	};
@@ -124,7 +106,7 @@ fn report(
 	Ok(())
 }
 
-/// 表示・承認を担う Handler。
+/// 表示を担う Handler。
 struct CliHandler {
 	no_thinking: bool,
 }
@@ -174,7 +156,6 @@ fn format_result(content: &str) -> String {
 	out
 }
 
-#[async_trait::async_trait]
 impl llm::RunHandler for CliHandler {
 	fn on_text(&mut self, text: &str) {
 		eprintln!("{text}");
@@ -193,18 +174,6 @@ impl llm::RunHandler for CliHandler {
 	fn on_tool_result(&mut self, _call: &llm::ToolCall, output: &llm::ToolOutput) {
 		let mark = if output.is_error { "✗ error" } else { "✓ ok" };
 		eprintln!("  {mark}\n{}", format_result(&output.content));
-	}
-
-	// `--yes` は ApprovalPolicy::AutoApprove になり、ここは呼ばれない。
-	async fn approve(&mut self, call: &llm::ToolCall, _spec: &llm::ToolSpec) -> bool {
-		eprint!("  {} を実行する? [y/N] ", call.name);
-		// stdin はブロッキングなので別スレッドで待つ。EOF (非対話) は拒否扱い。
-		tokio::task::spawn_blocking(|| {
-			let mut line = String::new();
-			std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim(), "y" | "Y" | "yes")
-		})
-		.await
-		.unwrap_or(false)
 	}
 }
 

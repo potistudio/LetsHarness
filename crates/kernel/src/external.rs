@@ -143,6 +143,7 @@ pub struct Event {
 	pub method: String,
 	pub params: Value,
 	/// 問い合わせ (応答が要る) のときの id。
+	/// 現在 `PluginServer` にはこれを送る API が無い (プロトコル上の予約)。
 	pub reply_id: Option<u64>,
 }
 

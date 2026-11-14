@@ -33,7 +33,6 @@ impl Tool for EditFile {
 				"replace_all": {"type": "boolean", "description": "全一致を置換する (既定 false)"},
 			}),
 			&["path", "old_string", "new_string"],
-			true,
 		)
 	}
 

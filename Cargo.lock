@@ -660,7 +660,6 @@ name = "letsharness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "clap",
  "letsharness-kernel",
  "serde_json",

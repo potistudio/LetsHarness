@@ -59,13 +59,7 @@ impl Host {
 		let conn = entry.connection().await?;
 		let created = conn.call("agent.create", json!({ "kind": kind, "cfg": cfg })).await?;
 		let (instance, name) = created_instance(entry.name, &created)?;
-		let asks_approval = created.get("asks_approval").and_then(Value::as_bool).unwrap_or(true);
-		Ok(Arc::new(RemoteAgent {
-			conn,
-			instance,
-			name,
-			asks_approval,
-		}))
+		Ok(Arc::new(RemoteAgent { conn, instance, name }))
 	}
 
 	pub fn has_agent_backend(&self, kind: &str) -> bool {
@@ -321,10 +315,9 @@ struct RemoteAgent {
 	conn: Arc<Connection>,
 	instance: u64,
 	name: &'static str,
-	asks_approval: bool,
 }
 
-/// エージェントの途中経過・承認の問い合わせを [`RunHandler`] に渡す。
+/// エージェントの途中経過を [`RunHandler`] に渡す。
 struct HandlerSink<'a> {
 	handler: &'a mut dyn RunHandler,
 }
@@ -354,14 +347,6 @@ impl EventSink for HandlerSink<'_> {
 					self.handler.on_tool_result(&call, &output);
 				}
 			}
-			"agent.approve" => {
-				let spec = serde_json::from_value::<ToolSpec>(params.get("spec").cloned().unwrap_or_default());
-				let approved = match (call(), spec) {
-					(Some(call), Ok(spec)) => self.handler.approve(&call, &spec).await,
-					_ => false,
-				};
-				return Some(Ok(json!(approved)));
-			}
 			_ => {}
 		}
 		None
@@ -372,10 +357,6 @@ impl EventSink for HandlerSink<'_> {
 impl AgentBackend for RemoteAgent {
 	fn name(&self) -> &'static str {
 		self.name
-	}
-
-	fn asks_approval(&self) -> bool {
-		self.asks_approval
 	}
 
 	async fn list_models(&self) -> Result<Vec<ModelInfo>> {

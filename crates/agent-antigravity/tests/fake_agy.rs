@@ -5,9 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use letsharness_agent_antigravity::AntigravityAgent;
-use letsharness_kernel::{
-	AgentBackend, AgentRequest, ApprovalPolicy, ChatMessage, Error, RunHandler, ToolCall, ToolOutput, ToolSpec,
-};
+use letsharness_kernel::{AgentBackend, AgentRequest, ChatMessage, Error, RunHandler, ToolCall, ToolOutput};
 
 /// `body` を本文とする実行可能スクリプトを作る。受け取った引数は `<name>.args` に1行ずつ残す。
 fn fake_agy(name: &str, body: &str) -> (AntigravityAgent, PathBuf) {
@@ -32,11 +30,10 @@ fn read_args(path: &PathBuf) -> Vec<String> {
 		.collect()
 }
 
-/// 通知を記録し、承認を求められたら失敗させるハンドラ (外部エージェントは approve を呼ばない)。
+/// 通知を記録するハンドラ。
 #[derive(Default)]
 struct Rec(Vec<String>);
 
-#[async_trait::async_trait]
 impl RunHandler for Rec {
 	fn on_text(&mut self, t: &str) {
 		self.0.push(format!("text:{t}"));
@@ -49,9 +46,6 @@ impl RunHandler for Rec {
 	}
 	fn on_tool_result(&mut self, c: &ToolCall, o: &ToolOutput) {
 		self.0.push(format!("result:{}:{}", c.name, o.content));
-	}
-	async fn approve(&mut self, _: &ToolCall, _: &ToolSpec) -> bool {
-		panic!("外部エージェントでは approve は呼ばれない");
 	}
 }
 
@@ -71,7 +65,6 @@ echo "progress..." >&2"#;
 #[tokio::test]
 async fn runs_and_reports_steps() {
 	let (agy, args_file) = fake_agy("success", SUCCESS);
-	assert!(!agy.asks_approval());
 	let mut h = Rec::default();
 	let req = AgentRequest::new("gemini-x", vec![ChatMessage::system("sys"), ChatMessage::user("-q")]);
 	let out = agy.run(req, &mut h).await.unwrap();
@@ -105,7 +98,7 @@ async fn runs_and_reports_steps() {
 }
 
 #[tokio::test]
-async fn resume_and_auto_approve_flags() {
+async fn resume_flags() {
 	let (agy, args_file) = fake_agy(
 		"resume",
 		r#"echo '{"event":"result","result":{"conversation_id":"conv-1","status":"SUCCESS","response":"続き"}}'"#,
@@ -119,7 +112,6 @@ async fn resume_and_auto_approve_flags() {
 		],
 	);
 	req.session_id = Some("conv-1".into());
-	req.approval = ApprovalPolicy::AutoApprove;
 	let out = agy.run(req, &mut Rec::default()).await.unwrap();
 	assert_eq!((out.text.as_str(), out.steps), ("続き", 1));
 	assert!(out.usage.is_none());
@@ -129,7 +121,6 @@ async fn resume_and_auto_approve_flags() {
 		[
 			"--conversation",
 			"conv-1",
-			"--dangerously-skip-permissions",
 			"--output-format",
 			"stream-json",
 			"--disable-slash-commands",

@@ -1,8 +1,7 @@
 //! ループ本体。
 
 use crate::{
-	ApprovalPolicy, ChatMessage, DEFAULT_MAX_STEPS, Error, Provider, Result, RunHandler, ToolCall, ToolOutput,
-	ToolRegistry, Usage,
+	ChatMessage, DEFAULT_MAX_STEPS, Error, Provider, Result, RunHandler, ToolCall, ToolOutput, ToolRegistry, Usage,
 };
 
 /// ループの依頼。
@@ -13,7 +12,6 @@ pub struct LoopRequest {
 	pub max_tokens: Option<u32>,
 	/// モデルを呼ぶ回数の上限 (暴走防止)。
 	pub max_steps: usize,
-	pub approval: ApprovalPolicy,
 }
 
 impl LoopRequest {
@@ -23,7 +21,6 @@ impl LoopRequest {
 			messages,
 			max_tokens: None,
 			max_steps: DEFAULT_MAX_STEPS,
-			approval: ApprovalPolicy::default(),
 		}
 	}
 }
@@ -57,7 +54,6 @@ pub async fn run_loop(
 		mut messages,
 		max_tokens,
 		max_steps,
-		approval,
 	} = req;
 	if max_steps == 0 {
 		return Err(Error::Config("max_steps は 1 以上が必要です".into()));
@@ -110,7 +106,7 @@ pub async fn run_loop(
 			turn.tool_calls.clone(),
 		));
 		for call in &turn.tool_calls {
-			let output = execute(tools, handler, call, approval).await;
+			let output = execute(tools, handler, call).await;
 			handler.on_tool_result(call, &output);
 			messages.push(ChatMessage::tool_result(&call.id, tool_result_text(&output)));
 		}
@@ -118,19 +114,11 @@ pub async fn run_loop(
 	unreachable!("max_steps >= 1 のためループ内で必ず return する")
 }
 
-async fn execute(
-	tools: &ToolRegistry,
-	handler: &mut dyn RunHandler,
-	call: &ToolCall,
-	approval: ApprovalPolicy,
-) -> ToolOutput {
+async fn execute(tools: &ToolRegistry, handler: &mut dyn RunHandler, call: &ToolCall) -> ToolOutput {
 	handler.on_tool_call(call);
-	let Some((spec, tool)) = tools.get(&call.name) else {
+	let Some((_, tool)) = tools.get(&call.name) else {
 		return ToolOutput::error(format!("unknown tool: {}", call.name));
 	};
-	if spec.requires_approval && approval == ApprovalPolicy::Ask && !handler.approve(call, spec).await {
-		return ToolOutput::error("denied: ユーザーがこのツール実行を許可しませんでした");
-	}
 	tool.call(call.arguments.clone()).await
 }
 
@@ -250,7 +238,6 @@ mod tests {
 	}
 
 	struct Echo {
-		approval: bool,
 		runs: Arc<Mutex<u32>>,
 	}
 
@@ -258,10 +245,9 @@ mod tests {
 	impl Tool for Echo {
 		fn spec(&self) -> ToolSpec {
 			ToolSpec {
-				name: if self.approval { "danger" } else { "echo" }.into(),
+				name: "echo".into(),
 				description: "".into(),
 				input_schema: serde_json::json!({"type": "object"}),
-				requires_approval: self.approval,
 			}
 		}
 		async fn call(&self, args: serde_json::Value) -> ToolOutput {
@@ -272,11 +258,9 @@ mod tests {
 
 	#[derive(Default)]
 	struct Rec {
-		allow: bool,
 		events: Vec<String>,
 	}
 
-	#[async_trait::async_trait]
 	impl RunHandler for Rec {
 		fn on_text(&mut self, t: &str) {
 			self.events.push(format!("text:{t}"));
@@ -287,21 +271,10 @@ mod tests {
 		fn on_tool_result(&mut self, c: &ToolCall, o: &ToolOutput) {
 			self.events.push(format!("result:{}:{}", c.name, o.is_error));
 		}
-		async fn approve(&mut self, _: &ToolCall, _: &ToolSpec) -> bool {
-			self.allow
-		}
 	}
 
 	fn registry(runs: &Arc<Mutex<u32>>) -> ToolRegistry {
-		ToolRegistry::new()
-			.with(Arc::new(Echo {
-				approval: false,
-				runs: runs.clone(),
-			}))
-			.with(Arc::new(Echo {
-				approval: true,
-				runs: runs.clone(),
-			}))
+		ToolRegistry::new().with(Arc::new(Echo { runs: runs.clone() }))
 	}
 
 	fn req() -> LoopRequest {
@@ -344,38 +317,6 @@ mod tests {
 				"result:echo:false"
 			]
 		);
-	}
-
-	#[tokio::test]
-	async fn approval_is_denied_by_default_and_error_is_fed_back() {
-		let runs = Arc::new(Mutex::new(0));
-		let p = Scripted::new(vec![turn("", vec![call("c1", "danger")]), turn("ok", vec![])]);
-		let mut h = Rec::default(); // allow = false
-		let out = run_loop(&p, &registry(&runs), &mut h, req()).await.unwrap();
-
-		assert_eq!(*runs.lock().unwrap(), 0, "拒否時は実行されない");
-		assert!(out.messages[2].content.starts_with("Error: denied"));
-		assert!(h.events.contains(&"result:danger:true".to_string()));
-
-		let runs = Arc::new(Mutex::new(0));
-		let p = Scripted::new(vec![turn("", vec![call("c1", "danger")]), turn("ok", vec![])]);
-		let mut h = Rec {
-			allow: true,
-			..Default::default()
-		};
-		run_loop(&p, &registry(&runs), &mut h, req()).await.unwrap();
-		assert_eq!(*runs.lock().unwrap(), 1);
-	}
-
-	#[tokio::test]
-	async fn auto_approve_skips_handler() {
-		let runs = Arc::new(Mutex::new(0));
-		let p = Scripted::new(vec![turn("", vec![call("c1", "danger")]), turn("ok", vec![])]);
-		let mut h = Rec::default(); // allow = false でも聞かれない
-		let mut r = req();
-		r.approval = ApprovalPolicy::AutoApprove;
-		run_loop(&p, &registry(&runs), &mut h, r).await.unwrap();
-		assert_eq!(*runs.lock().unwrap(), 1);
 	}
 
 	#[tokio::test]

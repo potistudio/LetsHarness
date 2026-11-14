@@ -36,7 +36,6 @@ impl Tool for ReadFile {
 				"limit": {"type": "integer", "description": "読む行数 (既定 2000)"},
 			}),
 			&["path"],
-			false,
 		)
 	}
 

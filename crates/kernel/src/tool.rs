@@ -26,11 +26,6 @@ pub struct ToolSpec {
 
 	/// 引数の JSON Schema (`{"type":"object","properties":{...}}`)。
 	pub input_schema: serde_json::Value,
-
-	/// `true` なら実行前に [`RunHandler::approve`](crate::RunHandler::approve) で承認を取る。
-	/// 副作用のあるツール (書き込み・コマンド実行など) は立てる。
-	#[serde(default)]
-	pub requires_approval: bool,
 }
 
 /// モデルが要求した1回のツール呼び出し。
@@ -155,7 +150,6 @@ mod tests {
 				name: self.0.into(),
 				description: self.1.into(),
 				input_schema: serde_json::json!({"type": "object"}),
-				requires_approval: false,
 			}
 		}
 		async fn call(&self, _args: serde_json::Value) -> ToolOutput {

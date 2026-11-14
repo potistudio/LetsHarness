@@ -4,11 +4,11 @@
 //! (Antigravity CLI など)。こちらがモデルとツールでループを回す場合は [`run_loop`](crate::run_loop) で、
 //! Agent とは呼ばない。`Provider` (1回の呼び出しがモデル1回) とも別。
 //!
-//! 表示・承認は [`RunHandler`] 経由で Client に委ねる。
+//! 表示は [`RunHandler`] 経由で Client に委ねる。
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ApprovalPolicy, ChatMessage, DEFAULT_MAX_STEPS, Error, ModelInfo, Result, RunHandler, Usage};
+use crate::{ChatMessage, DEFAULT_MAX_STEPS, Error, ModelInfo, Result, RunHandler, Usage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
@@ -18,7 +18,6 @@ pub struct AgentRequest {
 	pub max_tokens: Option<u32>,
 	/// モデル呼び出しの上限回数。外部エージェントでは効かないことがある。
 	pub max_steps: usize,
-	pub approval: ApprovalPolicy,
 	/// 外部エージェントが持つ会話を再開する ID ([`AgentOutcome::session_id`])。
 	/// 指定時、相手は履歴を持っているので `messages` は最後の依頼だけが使われる。
 	pub session_id: Option<String>,
@@ -31,7 +30,6 @@ impl AgentRequest {
 			messages,
 			max_tokens: None,
 			max_steps: DEFAULT_MAX_STEPS,
-			approval: ApprovalPolicy::default(),
 			session_id: None,
 		}
 	}
@@ -60,13 +58,6 @@ pub struct AgentOutcome {
 pub trait AgentBackend: Send + Sync {
 	/// 例: `"loop"` / `"antigravity"`。
 	fn name(&self) -> &'static str;
-
-	/// ツール実行前に [`RunHandler::approve`] を呼べるか。
-	/// `false` のバックエンドでは承認は [`ApprovalPolicy`] (起動時の権限) でしか制御できず、
-	/// ハンドラには実行の通知 (`on_tool_call` / `on_tool_result`) だけが届く。
-	fn asks_approval(&self) -> bool {
-		true
-	}
 
 	/// 使えるモデルの一覧。
 	async fn list_models(&self) -> Result<Vec<ModelInfo>> {

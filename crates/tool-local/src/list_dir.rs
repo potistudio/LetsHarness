@@ -27,7 +27,6 @@ impl Tool for ListDir {
 				"path": {"type": "string", "description": "作業ディレクトリからの相対パス (既定 `.`)"},
 			}),
 			&[],
-			false,
 		)
 	}
 
