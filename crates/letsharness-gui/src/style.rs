@@ -1,7 +1,7 @@
 //! Claude 風の配色とウィジェットのスタイル。
 
 use iced::widget::{button, column, container, markdown, pick_list, rich_text, scrollable, text, text_editor};
-use iced::{Background, Border, Color, Element, Fill, Font, Shadow, Theme, Vector, border, color, font, theme};
+use iced::{Background, Border, Color, Element, Fill, Font, Shadow, Theme, Vector, border, color, theme};
 
 use crate::squircle::{Surface, squircle};
 
@@ -18,9 +18,22 @@ pub const ACCENT_HOVER: Color = color!(0xC6613F);
 pub const DANGER: Color = color!(0xB53333);
 pub const RADIUS: f32 = 8.0;
 
-pub const SERIF: Font = Font {
-	family: font::Family::Serif,
-	..Font::DEFAULT
+/// OS のシステムフォント。macOS は SF (`SFNS.ttf` の family 名が `System Font`)、Windows は Segoe UI。
+pub const SYSTEM: Font = if cfg!(target_os = "macos") {
+	Font::with_name("System Font")
+} else if cfg!(windows) {
+	Font::with_name("Segoe UI")
+} else {
+	Font::DEFAULT
+};
+
+/// OS のシステム等幅フォント。macOS は SF Mono、Windows は Consolas。
+pub const MONO: Font = if cfg!(target_os = "macos") {
+	Font::with_name(".SF NS Mono")
+} else if cfg!(windows) {
+	Font::with_name("Consolas")
+} else {
+	Font::MONOSPACE
 };
 
 pub fn theme() -> Theme {
@@ -165,6 +178,9 @@ pub fn markdown_settings() -> markdown::Settings {
 		border: border::rounded(4),
 	};
 	style.inline_code_color = TEXT;
+	style.font = SYSTEM;
+	style.inline_code_font = MONO;
+	style.code_block_font = MONO;
 	let mut settings = markdown::Settings::with_text_size(15, style);
 	settings.code_size = 13.into();
 	settings
@@ -185,10 +201,16 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for MarkdownViewer {
 		_code: &'a str,
 		lines: &'a [markdown::Text],
 	) -> Element<'a, markdown::Uri> {
+		// 各 span が本文のフォントを持っているので、等幅フォントで上書きする。
 		let code = column(lines.iter().map(|line| {
-			rich_text(line.spans(settings.style))
+			let spans: Vec<_> = line
+				.spans(settings.style)
+				.iter()
+				.cloned()
+				.map(|span| span.font(settings.style.code_block_font))
+				.collect();
+			rich_text(spans)
 				.on_link_click(Self::on_link_click)
-				.font(settings.style.code_block_font)
 				.size(settings.code_size)
 				.into()
 		}));

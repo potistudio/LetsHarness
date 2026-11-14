@@ -3,6 +3,7 @@
 //! CLI と同じく `Kernel::boot` で Kernel を動かし、返ってきた [`Host`] に Provider を頼むだけ。
 //! 起動引数の `-o key=value` はそのまま Kernel とプロバイダに渡す。
 
+mod fonts;
 mod squircle;
 mod style;
 
@@ -14,7 +15,7 @@ use iced::task::{self, Task};
 use iced::widget::{
 	button, center, column, container, markdown, mouse_area, pick_list, row, scrollable, space, text, text_editor,
 };
-use iced::{Center, Element, Fill, Font, Length, Size, window};
+use iced::{Center, Element, Fill, Length, Size, window};
 use squircle::squircle;
 
 use letsharness_kernel::{BootConfig, ChatMessage, ChatOutput, Host, Kernel, Provider};
@@ -27,9 +28,11 @@ const COLUMN_WIDTH: f32 = 720.0;
 const TITLEBAR_HEIGHT: f32 = if cfg!(target_os = "macos") { 28.0 } else { 0.0 };
 
 fn main() -> iced::Result {
+	fonts::register_system_font_weights();
 	iced::application(App::boot, App::update, App::view)
 		.title(App::title)
 		.theme(|_: &App| style::theme())
+		.default_font(style::SYSTEM)
 		.window(window_settings())
 		.run()
 }
@@ -374,12 +377,9 @@ impl App {
 	}
 
 	fn sidebar(&self) -> Element<'_, Message> {
-		let brand = row![
-			text("✻").size(22).color(style::ACCENT),
-			text("LetsHarness").size(18).font(style::SERIF)
-		]
-		.spacing(8)
-		.align_y(Center);
+		let brand = row![text("✻").size(22).color(style::ACCENT), text("LetsHarness").size(18)]
+			.spacing(8)
+			.align_y(Center);
 
 		let new_chat = button(
 			row![text("+").size(16).color(style::ACCENT), text("New chat").size(14)]
@@ -437,7 +437,7 @@ impl App {
 		if conversation.entries.is_empty() {
 			let greeting = row![
 				text("✻").size(34).color(style::ACCENT),
-				text("How can I help you today?").size(34).font(style::SERIF)
+				text("How can I help you today?").size(34)
 			]
 			.spacing(12)
 			.align_y(Center);
@@ -559,7 +559,7 @@ impl App {
 				.on_press(Message::Stop)
 				.style(style::round(style::TEXT, style::MUTED))
 		} else {
-			button(center(text("↑").size(18).font(Font::MONOSPACE)))
+			button(center(text("↑").size(18)))
 				.on_press_maybe(self.can_send().then_some(Message::Send))
 				.style(style::round(style::ACCENT, style::ACCENT_HOVER))
 		}
