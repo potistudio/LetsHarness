@@ -1,4 +1,4 @@
-//! 同梱ツール: `read_file` / `list_dir` / `write_file` / `edit_file` / `bash`.
+//! ローカルツール: `read_file` / `list_dir` / `write_file` / `edit_file` / `bash`.
 //!
 //! すべて作業ディレクトリ (`root`) を基準に動く。
 //!
@@ -32,7 +32,7 @@ use workspace::Workspace;
 use write_file::WriteFile;
 
 /// 同梱ツール一式。`root` は作業ディレクトリ。
-pub fn builtin_tools(root: impl Into<PathBuf>) -> Vec<Arc<dyn Tool>> {
+pub fn local_tools(root: impl Into<PathBuf>) -> Vec<Arc<dyn Tool>> {
 	let ws = Arc::new(Workspace::new(root));
 	vec![
 		Arc::new(ReadFile(ws.clone())),

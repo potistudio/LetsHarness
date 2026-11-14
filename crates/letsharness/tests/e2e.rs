@@ -9,7 +9,8 @@ use std::sync::Once;
 
 const PLUGINS: &[&str] = &[
 	"letsharness-provider-mock",
-	"letsharness-tool-builtin",
+	"letsharness-tool-local",
+	"letsharness-agent-loop",
 	"letsharness-plugin-dotenv",
 	"letsharness-agent-antigravity",
 ];
@@ -129,7 +130,7 @@ fn kernel_runs_without_any_plugin() {
 }
 
 #[test]
-fn builtin_agent_runs_tools_in_an_external_process() {
+fn loop_agent_borrows_model_and_tools_through_the_kernel() {
 	let dir = std::env::temp_dir().join(format!("lh-e2e-{}", std::process::id()));
 	std::fs::create_dir_all(&dir).unwrap();
 	let out = letsharness(&[

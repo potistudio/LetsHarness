@@ -1,5 +1,0 @@
-name = "builtin-tools"
-command = "letsharness-tool-builtin"
-
-[contributes]
-tool = ["builtin"]

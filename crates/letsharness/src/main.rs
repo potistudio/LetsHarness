@@ -49,12 +49,12 @@ struct Cli {
 	/// モデルの差し替えポイント (登録されたプロバイダの kind): commandcode | gemini | mock
 	#[arg(long, global = true, default_value = "commandcode")]
 	provider: String,
-	/// エージェントの担い手 (`agent` / `models` で有効)
+	/// エージェントの担い手 (登録されたエージェントの kind)。`agent` は省略すると `loop`、`models` は省略すると `--provider` を引く
 	///
-	/// builtin     : --provider のモデル + 同梱ツールで LetsHarness がループを回す
+	/// loop        : --provider のモデル + ローカルツールで LetsHarness がループを回す
 	/// antigravity : Antigravity CLI (`agy`) に丸ごと任せる (ツール・認証も agy 側)
-	#[arg(long, global = true, default_value = "builtin")]
-	backend: String,
+	#[arg(long, global = true)]
+	backend: Option<String>,
 	/// プラグイン固有の設定 (例: `-o prefix=">> "` / `-o error=boom` は mock、`-o env_file=PATH` / `-o no_env_file=true` は dotenv)
 	#[arg(short = 'o', long = "option", global = true, value_name = "KEY=VALUE", value_parser = parse_option)]
 	options: Vec<(String, String)>,
@@ -109,13 +109,13 @@ enum Cmd {
 	},
 	/// ツールを使いながら最終回答まで自走する (非ストリーム)
 	///
-	/// --backend builtin: 同梱ツール read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
+	/// --backend loop (既定): ローカルツール read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
 	/// 承認は実行ごとに stderr で確認する。`--yes` で全承認 (bash は何でも実行できるので注意)。
 	///
 	/// --backend antigravity: agy が自分のツールで動く。承認はこちらに求められず、
 	/// agy の権限設定で許可されていない操作は却下される (`--yes` で全許可)。
 	Agent {
-		/// builtin では必須。antigravity で省略すると agy の既定モデル
+		/// loop では必須。antigravity で省略すると agy の既定モデル
 		#[arg(long)]
 		model: Option<String>,
 		#[arg(long)]
@@ -166,25 +166,25 @@ async fn make_client(host: &Host, provider: &str, options: &[(String, String)]) 
 	}
 }
 
-/// 外部エージェントを kernel に頼む。`builtin` は `--provider` から組み立てるので `None`。
-async fn make_external(
+/// エージェントを kernel に頼む。`provider` と `-o` はそのまま渡し、必要なエージェントだけが使う。
+async fn make_agent(
 	host: &Host,
 	backend: &str,
+	provider: &str,
+	options: &[(String, String)],
 	workdir: Option<&std::path::Path>,
-) -> Result<Option<Arc<dyn AgentBackend>>> {
-	if backend == "builtin" {
-		return Ok(None);
+) -> Result<Arc<dyn AgentBackend>> {
+	let mut cfg = options_cfg(options);
+	cfg["provider"] = json!(provider);
+	if let Some(dir) = workdir {
+		cfg["workdir"] = json!(dir);
 	}
-	let cfg = match workdir {
-		Some(dir) => json!({ "workdir": dir }),
-		None => json!({}),
-	};
-	Ok(Some(host.agent_backend(backend, &cfg).await?))
+	Ok(host.agent_backend(backend, &cfg).await?)
 }
 
 /// `chat` / `quota` は Provider (モデル) 専用。
-fn ensure_builtin(backend: &str, command: &str) -> Result<()> {
-	if backend == "builtin" {
+fn ensure_provider_only(backend: &Option<String>, command: &str) -> Result<()> {
+	if backend.is_none() {
 		return Ok(());
 	}
 	bail!("`{command}` はモデル (--provider) 専用です。--backend は `agent` / `models` でのみ使えます")
@@ -197,8 +197,11 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 	match cli.cmd {
 		Cmd::Models { limit, json } => {
 			// `dyn Provider` / `dyn AgentBackend` に対して呼ぶ = どの実装でも同じコード
-			let (name, models) = match make_external(host, &cli.backend, None).await? {
-				Some(agent) => (agent.name(), agent.list_models().await),
+			let (name, models) = match &cli.backend {
+				Some(backend) => {
+					let agent = make_agent(host, backend, &cli.provider, &cli.options, None).await?;
+					(agent.name(), agent.list_models().await)
+				}
 				None => {
 					let client = client().await?;
 					(client.name(), client.list_models().await)
@@ -242,7 +245,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			json,
 			no_thinking,
 		} => {
-			ensure_builtin(&cli.backend, "chat")?;
+			ensure_provider_only(&cli.backend, "chat")?;
 			run_chat(
 				&*client().await?,
 				model,
@@ -258,7 +261,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			.await?;
 		}
 		Cmd::Quota { json } => {
-			ensure_builtin(&cli.backend, "quota")?;
+			ensure_provider_only(&cli.backend, "quota")?;
 			run_quota(&*client().await?, json).await?;
 		}
 		Cmd::Agent {
@@ -273,16 +276,14 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			show_usage,
 			resume,
 		} => {
-			let backend: Arc<dyn AgentBackend> = match make_external(host, &cli.backend, Some(&workdir)).await? {
-				Some(agent) => agent,
-				None => {
-					if model.is_none() {
-						bail!("--backend builtin では --model が必要です");
-					}
-					let tools = host.tools(&json!({ "workdir": workdir })).await?;
-					Arc::new(llm::BuiltinAgent::new(client().await?, tools))
-				}
-			};
+			let backend = make_agent(
+				host,
+				cli.backend.as_deref().unwrap_or("loop"),
+				&cli.provider,
+				&cli.options,
+				Some(&workdir),
+			)
+			.await?;
 			agent::run(
 				backend,
 				agent::Options {

@@ -1,0 +1,5 @@
+name = "local-tools"
+command = "letsharness-tool-local"
+
+[contributes]
+tool = ["local"]

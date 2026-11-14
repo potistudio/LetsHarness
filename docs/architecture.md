@@ -14,8 +14,8 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | `kernel` | プラグインの発見・起動・通信 (`Kernel::boot` → `Host`)、共有型、拡張点 trait、プラグイン側の `PluginServer` | serde, tokio, toml (UI・HTTP ライブラリには依存しない) |
 | `letsharness` (Client) | CLI。`Kernel::boot` で kernel を動かし、`Host` に `kind` 名で頼む | **kernel のみ** (+ clap 等) |
 | `provider-*` | 各社 API の実装。`bin` + `plugin.toml` | kernel (+ reqwest 等) |
-| `agent-*` | 外部エージェント (CLI など) を `AgentBackend` として包む。`bin` + `plugin.toml` | kernel (+ tokio::process 等) |
-| `tool-*` | エージェントが呼ぶツール。`bin` + `plugin.toml` | kernel |
+| `agent-*` | `AgentBackend` の実装。`bin` + `plugin.toml` (例: ループを回す `agent-loop`、外部 CLI を包む `agent-antigravity`) | kernel (+ tokio::process 等) |
+| `tool-*` | エージェントが呼ぶツール。`bin` + `plugin.toml` (例: `tool-local`) | kernel |
 | `plugin-*` | 起動時フックなど。`bin` + `plugin.toml` (例: `plugin-dotenv`) | kernel |
 
 プラグイン同士・Client からプラグインへの Cargo 依存は存在しない。つながるのは実行時の発見と JSON だけ。
@@ -39,11 +39,16 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | 拡張点 | プラグインが実装する trait | Client から見える形 | 用途 |
 | --- | --- | --- | --- |
 | `provider` | `ProviderFactory` → `Provider` | `Host::provider(kind, cfg)` → `Arc<dyn Provider>` | LLM API。`create(cfg: Value)` でインスタンス化 |
-| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | 依頼を受けて最終回答まで自走する外部エージェント。途中経過と承認はプロセス間で往復する |
+| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | 依頼を受けて最終回答まで自走するもの。途中経過と承認はプロセス間で往復する。`Provider` とは「ループを誰が回すか」で分かれる |
 | `tool` | `ToolFactory` → `Tool` | `Host::tools(cfg)` → `ToolRegistry` | エージェントが呼ぶツール。スキーマは MCP と同形 |
 | `boot` | `BootHook` | (Kernel が起動時に呼ぶ) | 返した環境変数が、以降に起動するプラグインの環境に足される |
 
-組み込みエージェント `BuiltinAgent` (`Provider` + `ToolRegistry` で `run_agent` を回す) は kernel 内で動き、Client が組み立てる。
+`Provider` (1回の呼び出しがモデル1回) と `AgentBackend` (ループを相手が回す) は別の拡張点のまま。
+特別扱いする「組み込み」は無く、ループ型の `agent-loop` も他と同じ agent プラグイン。モデルとツールは自前で持たず、実行中だけ kernel に借りる:
+
+- `agent-loop` は `AgentHandler::host()` (`HostApi`) で `provider(kind, cfg)` / `tools(cfg)` を頼む。実体は plugin → kernel の `host.*` リクエスト。
+- kernel は自分の `Host` で引いて貸すだけ。プラグイン同士は互いを知らず、kernel が中継する。
+- 借りた Provider はエージェントが使う非ストリームの呼び出しのみ (ストリームは `Unsupported`)。
 `Hook` と `CliCommand` は未実装。
 
 ## Writing a plugin
@@ -99,7 +104,8 @@ path = "~/.letsharness/plugins/openai-compat"
 - 運ぶ手段は **stdio (1行1メッセージの JSON-RPC 風)**。メッセージは `crates/kernel/src/rpc.rs`。
   - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。
   - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。承認のようなプラグインから kernel への問い合わせも、同じ `req` を持つリクエスト。
-  - メソッド: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call`。
+  - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call`。
+  - プラグイン → kernel (`agent.run` の最中のみ): `agent.approve` / `host.provider.create` / `host.provider.call` / `host.tools.create` / `host.tool.call`。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
 - Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。
@@ -109,7 +115,7 @@ path = "~/.letsharness/plugins/openai-compat"
 1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。設定ファイル (`default_provider` / `[providers.x]`) を導入する。いまの `Provider` は多数のメソッドを持ち、そのまま線の上を流れている。
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
 3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response) を効かせる。
-4. MCP クライアント。`Tool` / `ToolRegistry` / `run_agent`、同梱ツール (`crates/tool-builtin`)、`AgentBackend` / `BuiltinAgent`、外部エージェント `crates/agent-antigravity` (`--backend antigravity`) は実装済み。
+4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、ループ型エージェント (`crates/agent-loop`、`--backend loop`)、外部エージェント `crates/agent-antigravity` (`--backend antigravity`) は実装済み。
 5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
 
@@ -198,12 +204,13 @@ classDiagram
     +boot(options) env
   }
 
-  %% ---- 同梱プラグイン (それぞれ bin + plugin.toml) ----
+  %% ---- プラグイン (それぞれ bin + plugin.toml) ----
   class ProviderCommandCode
   class ProviderGemini
   class ProviderMock
   class AgentAntigravity
-  class ToolBuiltin
+  class AgentLoop
+  class ToolLocal
   class PluginDotenv
 
   Client ..> Kernel : boot
@@ -234,7 +241,9 @@ classDiagram
   ProviderFactory <|.. ProviderGemini
   ProviderFactory <|.. ProviderMock
   AgentBackendFactory <|.. AgentAntigravity
-  ToolFactory <|.. ToolBuiltin
+  AgentBackendFactory <|.. AgentLoop
+  ToolFactory <|.. ToolLocal
+  AgentLoop ..> Host : モデルとツールを借りる (kernel が中継)
   BootHook <|.. PluginDotenv
 
   note for Client "kernel にしか依存しない\nプラグインの列挙もリンクもしない"

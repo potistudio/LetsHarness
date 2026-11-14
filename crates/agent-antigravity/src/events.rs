@@ -512,7 +512,7 @@ mod tests {
 	}
 
 	#[test]
-	fn tracker_maps_steps_like_builtin_loop() {
+	fn tracker_maps_steps_like_loop_agent() {
 		let mut h = Rec::default();
 		let mut t = StepTracker::default();
 		for s in [

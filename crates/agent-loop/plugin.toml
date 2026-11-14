@@ -1,0 +1,5 @@
+name = "loop"
+command = "letsharness-agent-loop"
+
+[contributes]
+agent = ["loop"]

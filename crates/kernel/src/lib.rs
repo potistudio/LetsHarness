@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 mod agent;
+mod dispatch;
 mod external;
 mod host;
 mod kernel;
@@ -16,9 +17,7 @@ mod rpc;
 mod serve;
 mod tool;
 
-pub use agent::{
-	AgentBackend, AgentHandler, AgentOutcome, AgentRequest, ApprovalPolicy, BuiltinAgent, DEFAULT_MAX_STEPS, run_agent,
-};
+pub use agent::{AgentBackend, AgentHandler, AgentOutcome, AgentRequest, ApprovalPolicy, DEFAULT_MAX_STEPS, HostApi};
 pub use external::{Contributes, MANIFEST_FILE, Manifest};
 pub use host::Host;
 pub use kernel::{BootConfig, Kernel};

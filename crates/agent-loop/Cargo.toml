@@ -1,6 +1,6 @@
 [package]
-name = "letsharness-tool-builtin"
-description = "Built-in tools (file read/write/edit, directory listing, shell) for LetsHarness."
+name = "letsharness-agent-loop"
+description = "Agent loop plugin: runs a model (Provider) and tools in a loop, borrowing both from the kernel."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,5 @@ repository.workspace = true
 [dependencies]
 letsharness-kernel.workspace = true
 tokio.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

@@ -3,24 +3,29 @@
 //! Client は `Host` に `kind` 名で頼むだけで、どのプラグインが提供しているか・
 //! どう通信しているかは知らない。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::dispatch::{call_provider, field, to_value};
 use crate::external::{Connection, EventSink, NoEvents, PluginEntry};
 use crate::{
 	AgentBackend, AgentHandler, AgentOutcome, AgentRequest, ChatMessage, ChatOutput, Completion, Error, ModelInfo,
 	Provider, Quota, Result, Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec,
 };
 
+#[derive(Clone)]
 pub struct Host {
-	entries: Vec<Arc<PluginEntry>>,
+	entries: Arc<Vec<Arc<PluginEntry>>>,
 }
 
 impl Host {
 	pub(crate) fn new(entries: Vec<Arc<PluginEntry>>) -> Self {
-		Self { entries }
+		Self {
+			entries: Arc::new(entries),
+		}
 	}
 
 	/// 見つかったプラグインの名前。
@@ -59,6 +64,7 @@ impl Host {
 		let (instance, name) = created_instance(entry.name, &created)?;
 		let asks_approval = created.get("asks_approval").and_then(Value::as_bool).unwrap_or(true);
 		Ok(Arc::new(RemoteAgent {
+			host: self.clone(),
 			conn,
 			instance,
 			name,
@@ -138,7 +144,7 @@ struct StreamSink<'a> {
 
 #[async_trait::async_trait]
 impl EventSink for StreamSink<'_> {
-	async fn on_event(&mut self, method: &str, params: Value) -> Option<Value> {
+	async fn on_event(&mut self, method: &str, params: Value) -> Option<Result<Value>> {
 		let text = params.get("text").and_then(Value::as_str).unwrap_or_default();
 		match method {
 			"stream.delta" => (self.on_delta)(text),
@@ -301,20 +307,94 @@ impl Provider for RemoteProvider {
 // ---------------------------------------------------------------------------
 
 struct RemoteAgent {
+	/// プラグインに借りられるモデル・ツールの供給元。
+	host: Host,
 	conn: Arc<Connection>,
 	instance: u64,
 	name: &'static str,
 	asks_approval: bool,
 }
 
-/// エージェントの途中経過・承認の問い合わせを [`AgentHandler`] に渡す。
+/// エージェントの途中経過・承認の問い合わせを [`AgentHandler`] に渡し、
+/// モデル・ツールの借用 (`host.*`) を [`Host`] で満たす。
 struct HandlerSink<'a> {
 	handler: &'a mut dyn AgentHandler,
+	host: &'a Host,
+	/// 貸し出し中のもの。`id` は貸した順に振る。
+	providers: HashMap<u64, Arc<dyn Provider>>,
+	tools: HashMap<u64, Arc<dyn Tool>>,
+	next_id: u64,
+}
+
+impl<'a> HandlerSink<'a> {
+	fn new(handler: &'a mut dyn AgentHandler, host: &'a Host) -> Self {
+		Self {
+			handler,
+			host,
+			providers: HashMap::new(),
+			tools: HashMap::new(),
+			next_id: 1,
+		}
+	}
+
+	fn id(&mut self) -> u64 {
+		self.next_id += 1;
+		self.next_id
+	}
+
+	/// プラグインからの `host.*` 問い合わせに答える。
+	async fn lend(&mut self, method: &str, params: &Value) -> Result<Value> {
+		match method {
+			"host.provider.create" => {
+				let kind: String = field(params, "kind")?;
+				let provider = self
+					.host
+					.provider(&kind, params.get("cfg").unwrap_or(&Value::Null))
+					.await?;
+				let (id, name) = (self.id(), provider.name());
+				self.providers.insert(id, provider);
+				Ok(json!({ "instance": id, "name": name }))
+			}
+			"host.provider.call" => {
+				let instance: u64 = field(params, "instance")?;
+				let method: String = field(params, "method")?;
+				if method.contains("stream") {
+					return Err(Error::Unsupported(format!("{method} (kernel 経由の借用では非対応)")));
+				}
+				let provider = self
+					.providers
+					.get(&instance)
+					.ok_or_else(|| Error::Config(format!("unknown provider instance: {instance}")))?;
+				call_provider(&**provider, &method, params, &mut |_: &str| {}, &mut |_: &str| {}).await
+			}
+			"host.tools.create" => {
+				let tools = self.host.tools(params.get("cfg").unwrap_or(&Value::Null)).await?;
+				let mut infos = Vec::new();
+				for spec in tools.specs() {
+					if let Some((_, tool)) = tools.get(&spec.name) {
+						let id = self.id();
+						self.tools.insert(id, tool.clone());
+						infos.push(json!({ "id": id, "spec": spec }));
+					}
+				}
+				Ok(json!({ "tools": infos }))
+			}
+			"host.tool.call" => {
+				let id: u64 = field(params, "tool")?;
+				let tool = self
+					.tools
+					.get(&id)
+					.ok_or_else(|| Error::Config(format!("unknown tool: {id}")))?;
+				to_value(tool.call(params.get("args").cloned().unwrap_or(Value::Null)).await)
+			}
+			other => Err(Error::Unsupported(other.to_owned())),
+		}
+	}
 }
 
 #[async_trait::async_trait]
 impl EventSink for HandlerSink<'_> {
-	async fn on_event(&mut self, method: &str, params: Value) -> Option<Value> {
+	async fn on_event(&mut self, method: &str, params: Value) -> Option<Result<Value>> {
 		let text = || {
 			params
 				.get("text")
@@ -343,8 +423,9 @@ impl EventSink for HandlerSink<'_> {
 					(Some(call), Ok(spec)) => self.handler.approve(&call, &spec).await,
 					_ => false,
 				};
-				return Some(json!(approved));
+				return Some(Ok(json!(approved)));
 			}
+			m if m.starts_with("host.") => return Some(self.lend(m, &params).await),
 			_ => {}
 		}
 		None
@@ -371,7 +452,7 @@ impl AgentBackend for RemoteAgent {
 
 	async fn run(&self, req: AgentRequest, handler: &mut dyn AgentHandler) -> Result<AgentOutcome> {
 		let params = json!({ "instance": self.instance, "request": req });
-		let mut sink = HandlerSink { handler };
+		let mut sink = HandlerSink::new(handler, &self.host);
 		let v = self.conn.start("agent.run", params).await?.drive(&mut sink).await?;
 		serde_json::from_value(v).map_err(|e| Error::plugin(self.conn.name(), e))
 	}

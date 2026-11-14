@@ -1,10 +1,10 @@
-//! 同梱ツールを公開API (`builtin_tools`) だけで通す結合テスト。
+//! ローカルツールを公開API (`local_tools`) だけで通す結合テスト。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use letsharness_kernel::Tool;
-use letsharness_tool_builtin::builtin_tools;
+use letsharness_tool_local::local_tools;
 
 /// テストごとに使い捨ての作業ディレクトリを作る。
 struct TempRoot(PathBuf);
@@ -17,7 +17,7 @@ impl TempRoot {
 		Self(dir)
 	}
 	fn tool(&self, name: &str) -> Arc<dyn Tool> {
-		builtin_tools(&self.0)
+		local_tools(&self.0)
 			.into_iter()
 			.find(|t| t.spec().name == name)
 			.unwrap()
@@ -33,7 +33,7 @@ impl Drop for TempRoot {
 #[test]
 fn only_side_effecting_tools_need_approval() {
 	let t = TempRoot::new("spec");
-	let mut flags: Vec<_> = builtin_tools(&t.0)
+	let mut flags: Vec<_> = local_tools(&t.0)
 		.iter()
 		.map(|t| {
 			let s = t.spec();

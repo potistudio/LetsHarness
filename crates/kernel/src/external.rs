@@ -146,10 +146,10 @@ pub struct Event {
 	pub reply_id: Option<u64>,
 }
 
-/// [`Call`] の途中で届く [`Event`] の受け手。戻り値は問い合わせへの答え。
+/// [`Call`] の途中で届く [`Event`] の受け手。戻り値は問い合わせ (応答が要るもの) への答え。
 #[async_trait::async_trait]
 pub trait EventSink: Send {
-	async fn on_event(&mut self, method: &str, params: Value) -> Option<Value>;
+	async fn on_event(&mut self, method: &str, params: Value) -> Option<Result<Value>>;
 }
 
 /// 途中経過を使わない呼び出し用。
@@ -157,7 +157,7 @@ pub struct NoEvents;
 
 #[async_trait::async_trait]
 impl EventSink for NoEvents {
-	async fn on_event(&mut self, _method: &str, _params: Value) -> Option<Value> {
+	async fn on_event(&mut self, _method: &str, _params: Value) -> Option<Result<Value>> {
 		None
 	}
 }
@@ -349,7 +349,12 @@ impl Call {
 	async fn handle(&self, ev: Event, sink: &mut dyn EventSink) {
 		let answer = sink.on_event(&ev.method, ev.params).await;
 		if let Some(id) = ev.reply_id {
-			let _ = self.conn.send(Frame::ok(id, answer.unwrap_or(Value::Null))).await;
+			let reply = match answer {
+				Some(Ok(v)) => Frame::ok(id, v),
+				Some(Err(e)) => Frame::err(id, WireError::from(&e)),
+				None => Frame::ok(id, Value::Null),
+			};
+			let _ = self.conn.send(reply).await;
 		}
 	}
 
