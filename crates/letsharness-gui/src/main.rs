@@ -368,7 +368,7 @@ impl App {
 		// サイドバーの地の上に、メインパネルを squircle のカードとして浮かせる。
 		let panel = squircle(container(self.main()).width(Fill).height(Fill).clip(true), style::PANEL);
 		container(row![self.sidebar(), panel])
-			.padding(iced::Padding::new(10.0).left(0))
+			.padding(iced::Padding::new(4.0).left(0))
 			.style(style::sidebar)
 			.into()
 	}
