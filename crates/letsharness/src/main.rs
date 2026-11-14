@@ -109,11 +109,10 @@ enum Cmd {
 	},
 	/// ツールを使いながら最終回答まで自走する (非ストリーム)
 	///
-	/// --backend builtin: 同梱ツール read_file / list_dir (承認不要)、write_file / edit_file / bash (承認が必要)。
-	/// 承認は実行ごとに stderr で確認する。`--yes` で全承認 (bash は何でも実行できるので注意)。
+	/// --backend builtin: 同梱ツール read_file / list_dir / write_file / edit_file / bash を確認なしで実行する
+	/// (bash は何でも実行できるので注意)。
 	///
-	/// --backend antigravity: agy が自分のツールで動く。承認はこちらに求められず、
-	/// agy の権限設定で許可されていない操作は却下される (`--yes` で全許可)。
+	/// --backend antigravity: agy が自分のツールで動く。権限は agy の設定に従う (全許可も agy 側で設定する)。
 	Agent {
 		/// builtin では必須。antigravity で省略すると agy の既定モデル
 		#[arg(long)]
@@ -130,9 +129,6 @@ enum Cmd {
 		/// ツールの作業ディレクトリ。ファイル系ツールはこの外に出られない
 		#[arg(long, default_value = ".")]
 		workdir: std::path::PathBuf,
-		/// 承認が必要なツールを確認なしで実行する
-		#[arg(long, default_value_t = false)]
-		yes: bool,
 		/// 思考過程を表示しない
 		#[arg(long, default_value_t = false)]
 		no_thinking: bool,
@@ -268,7 +264,6 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			max_tokens,
 			max_steps,
 			workdir,
-			yes,
 			no_thinking,
 			show_usage,
 			resume,
@@ -291,7 +286,6 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 					system,
 					max_tokens,
 					max_steps,
-					yes,
 					no_thinking,
 					show_usage,
 					resume,

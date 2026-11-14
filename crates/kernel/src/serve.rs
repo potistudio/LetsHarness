@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::ToolSpec;
 use crate::rpc::{Frame, WireError};
@@ -109,8 +109,6 @@ impl PluginServer {
 		let inner = Arc::new(Inner {
 			server: self,
 			out,
-			pending: Mutex::new(HashMap::new()),
-			next_out: AtomicU64::new(1),
 			next_instance: AtomicU64::new(1),
 			providers: Mutex::new(HashMap::new()),
 			agents: Mutex::new(HashMap::new()),
@@ -135,26 +133,17 @@ impl PluginServer {
 			let Ok(frame) = serde_json::from_str::<Frame>(&line) else {
 				continue;
 			};
-			match (frame.id, frame.method) {
-				// Kernel からのリクエスト。長い呼び出しの最中も他を受けられるよう別タスクで処理する。
-				(Some(id), Some(method)) => {
-					let inner = inner.clone();
-					let params = frame.params.unwrap_or(Value::Null);
-					tokio::spawn(async move {
-						let reply = match inner.dispatch(&method, params).await {
-							Ok(v) => Frame::ok(id, v),
-							Err(e) => Frame::err(id, WireError::from(&e)),
-						};
-						let _ = inner.out.send(reply);
-					});
-				}
-				// こちらが出した問い合わせへの答え。
-				(Some(id), None) => {
-					if let Some(tx) = inner.pending.lock().unwrap().remove(&id) {
-						let _ = tx.send(frame.result.unwrap_or(Value::Null));
-					}
-				}
-				(None, _) => {}
+			// Kernel からのリクエスト。長い呼び出しの最中も他を受けられるよう別タスクで処理する。
+			if let (Some(id), Some(method)) = (frame.id, frame.method) {
+				let inner = inner.clone();
+				let params = frame.params.unwrap_or(Value::Null);
+				tokio::spawn(async move {
+					let reply = match inner.dispatch(&method, params).await {
+						Ok(v) => Frame::ok(id, v),
+						Err(e) => Frame::err(id, WireError::from(&e)),
+					};
+					let _ = inner.out.send(reply);
+				});
 			}
 		}
 		drop(inner);
@@ -165,9 +154,6 @@ impl PluginServer {
 struct Inner {
 	server: PluginServer,
 	out: mpsc::UnboundedSender<Frame>,
-	/// Kernel への問い合わせ (承認など) の答え待ち。
-	pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
-	next_out: AtomicU64,
 	next_instance: AtomicU64,
 	providers: Mutex<HashMap<u64, Arc<dyn Provider>>>,
 	agents: Mutex<HashMap<u64, Arc<dyn AgentBackend>>>,
@@ -195,16 +181,6 @@ impl Inner {
 	fn notify(&self, method: &str, req: u64, mut params: Value) {
 		params["req"] = req.into();
 		let _ = self.out.send(Frame::notify(method, params));
-	}
-
-	/// Kernel に問い合わせて答えを待つ。
-	async fn ask(&self, method: &str, req: u64, mut params: Value) -> Option<Value> {
-		params["req"] = req.into();
-		let id = self.next_out.fetch_add(1, Ordering::Relaxed);
-		let (tx, rx) = oneshot::channel();
-		self.pending.lock().unwrap().insert(id, tx);
-		self.out.send(Frame::request(id, method, params)).ok()?;
-		rx.await.ok()
 	}
 
 	async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
@@ -251,9 +227,9 @@ impl Inner {
 					.find(|f| f.kind() == kind || f.aliases().contains(&kind.as_str()))
 					.ok_or_else(|| Error::Config(format!("unknown backend: {kind}")))?;
 				let agent = factory.create(params.get("cfg").unwrap_or(&Value::Null))?;
-				let (id, name, asks) = (self.instance_id(), agent.name(), agent.asks_approval());
+				let (id, name) = (self.instance_id(), agent.name());
 				self.agents.lock().unwrap().insert(id, agent);
-				Ok(json!({ "instance": id, "name": name, "asks_approval": asks }))
+				Ok(json!({ "instance": id, "name": name }))
 			}
 			"agent.list_models" | "agent.run" => {
 				let instance: u64 = field(&params, "instance")?;
@@ -353,13 +329,12 @@ impl Inner {
 	}
 }
 
-/// エージェントの途中経過を Kernel へ通知し、承認は Kernel に問い合わせる。
+/// エージェントの途中経過を Kernel へ通知する。
 struct RpcHandler {
 	inner: Arc<Inner>,
 	req: u64,
 }
 
-#[async_trait::async_trait]
 impl AgentHandler for RpcHandler {
 	fn on_text(&mut self, text: &str) {
 		self.inner.notify("agent.on_text", self.req, json!({ "text": text }));
@@ -381,13 +356,5 @@ impl AgentHandler for RpcHandler {
 			self.req,
 			json!({ "call": call, "output": output }),
 		);
-	}
-
-	async fn approve(&mut self, call: &ToolCall, spec: &ToolSpec) -> bool {
-		let answer = self
-			.inner
-			.ask("agent.approve", self.req, json!({ "call": call, "spec": spec }))
-			.await;
-		answer.and_then(|v| v.as_bool()).unwrap_or(false)
 	}
 }

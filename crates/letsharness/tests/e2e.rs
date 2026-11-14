@@ -142,7 +142,6 @@ fn builtin_agent_runs_tools_in_an_external_process() {
 		r#"tool:write_file {"path":"a.txt","content":"from tool"}"#,
 		"--workdir",
 		dir.to_str().unwrap(),
-		"--yes",
 	]);
 	assert!(out.status.success(), "{}", stderr(&out));
 	assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "from tool");

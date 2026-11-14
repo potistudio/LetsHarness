@@ -16,9 +16,7 @@ mod rpc;
 mod serve;
 mod tool;
 
-pub use agent::{
-	AgentBackend, AgentHandler, AgentOutcome, AgentRequest, ApprovalPolicy, BuiltinAgent, DEFAULT_MAX_STEPS, run_agent,
-};
+pub use agent::{AgentBackend, AgentHandler, AgentOutcome, AgentRequest, BuiltinAgent, DEFAULT_MAX_STEPS, run_agent};
 pub use external::{Contributes, MANIFEST_FILE, Manifest};
 pub use host::Host;
 pub use kernel::{BootConfig, Kernel};

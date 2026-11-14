@@ -5,48 +5,29 @@
 //!   - 外部エージェント (Antigravity CLI など) : ループもツールも相手が持つ。
 //! - [`run_agent`] : 組み込みループ (モデル呼び出し → ツール実行 → 結果を返して再呼び出し)。
 //!
-//! kernel は UI を知らないため、表示・承認は [`AgentHandler`] 経由で Frontend に委ねる。
+//! kernel は UI を知らないため、表示は [`AgentHandler`] 経由で Frontend に委ねる。
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ChatMessage, Error, ModelInfo, Provider, Result, ToolCall, ToolOutput, ToolRegistry, ToolSpec, Usage};
+use crate::{ChatMessage, Error, ModelInfo, Provider, Result, ToolCall, ToolOutput, ToolRegistry, Usage};
 
 /// 1回の `run_agent` でモデルを呼ぶ回数の既定上限 (暴走防止)。
 pub const DEFAULT_MAX_STEPS: usize = 20;
 
-/// ループの進行を観測し、承認を返す口。Frontend が実装する。
+/// ループの進行を観測する口。Frontend が実装する。
 ///
-/// 通知系はすべて既定で何もしない。`approve` の既定は **拒否** (安全側):
-/// 承認が要るツールは、Handler が明示的に許可しない限り実行されない。
-#[async_trait::async_trait]
+/// 通知はすべて既定で何もしない。
 pub trait AgentHandler: Send {
 	/// ツール呼び出しに添えられた assistant の前置き本文。
 	/// 最終回答では呼ばれない (`AgentOutcome::text` で返る)。
 	fn on_text(&mut self, _text: &str) {}
 	fn on_thinking(&mut self, _thinking: &str) {}
-	/// 実行しようとしている呼び出し (承認前に通知)。
+	/// 実行しようとしている呼び出し。
 	fn on_tool_call(&mut self, _call: &ToolCall) {}
-	/// 実行結果 (拒否・未知のツールもここに来る)。
+	/// 実行結果 (未知のツールもここに来る)。
 	fn on_tool_result(&mut self, _call: &ToolCall, _output: &ToolOutput) {}
-	/// `ToolSpec::requires_approval` なツールの実行可否。
-	async fn approve(&mut self, _call: &ToolCall, _spec: &ToolSpec) -> bool {
-		false
-	}
-}
-
-/// 承認が必要なツール (`ToolSpec::requires_approval`) の扱い。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ApprovalPolicy {
-	/// 実行ごとに [`AgentHandler::approve`] で確認する。
-	///
-	/// 確認の口を持たない外部エージェント ([`AgentBackend::asks_approval`] が `false`) では、
-	/// エージェント側の設定で事前に許可されていないものは却下される。
-	#[default]
-	Ask,
-	/// 確認なしで全て実行する。
-	AutoApprove,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +38,6 @@ pub struct AgentRequest {
 	pub max_tokens: Option<u32>,
 	/// モデル呼び出しの上限回数。外部エージェントでは効かないことがある。
 	pub max_steps: usize,
-	pub approval: ApprovalPolicy,
 	/// 外部エージェントが持つ会話を再開する ID ([`AgentOutcome::session_id`])。
 	/// 指定時、相手は履歴を持っているので `messages` は最後の依頼だけが使われる。
 	pub session_id: Option<String>,
@@ -70,7 +50,6 @@ impl AgentRequest {
 			messages,
 			max_tokens: None,
 			max_steps: DEFAULT_MAX_STEPS,
-			approval: ApprovalPolicy::default(),
 			session_id: None,
 		}
 	}
@@ -99,13 +78,6 @@ pub struct AgentOutcome {
 pub trait AgentBackend: Send + Sync {
 	/// 例: `"builtin"` / `"antigravity"`。
 	fn name(&self) -> &'static str;
-
-	/// ツール実行前に [`AgentHandler::approve`] を呼べるか。
-	/// `false` のバックエンドでは承認は [`ApprovalPolicy`] (起動時の権限) でしか制御できず、
-	/// ハンドラには実行の通知 (`on_tool_call` / `on_tool_result`) だけが届く。
-	fn asks_approval(&self) -> bool {
-		true
-	}
 
 	/// 使えるモデルの一覧。
 	async fn list_models(&self) -> Result<Vec<ModelInfo>> {
@@ -167,7 +139,6 @@ pub async fn run_agent(
 		mut messages,
 		max_tokens,
 		max_steps,
-		approval,
 		session_id: _,
 	} = req;
 	if max_steps == 0 {
@@ -223,7 +194,7 @@ pub async fn run_agent(
 			turn.tool_calls.clone(),
 		));
 		for call in &turn.tool_calls {
-			let output = execute(tools, handler, call, approval).await;
+			let output = execute(tools, handler, call).await;
 			handler.on_tool_result(call, &output);
 			messages.push(ChatMessage::tool_result(&call.id, tool_result_text(&output)));
 		}
@@ -231,19 +202,11 @@ pub async fn run_agent(
 	unreachable!("max_steps >= 1 のためループ内で必ず return する")
 }
 
-async fn execute(
-	tools: &ToolRegistry,
-	handler: &mut dyn AgentHandler,
-	call: &ToolCall,
-	approval: ApprovalPolicy,
-) -> ToolOutput {
+async fn execute(tools: &ToolRegistry, handler: &mut dyn AgentHandler, call: &ToolCall) -> ToolOutput {
 	handler.on_tool_call(call);
-	let Some((spec, tool)) = tools.get(&call.name) else {
+	let Some((_, tool)) = tools.get(&call.name) else {
 		return ToolOutput::error(format!("unknown tool: {}", call.name));
 	};
-	if spec.requires_approval && approval == ApprovalPolicy::Ask && !handler.approve(call, spec).await {
-		return ToolOutput::error("denied: ユーザーがこのツール実行を許可しませんでした");
-	}
 	tool.call(call.arguments.clone()).await
 }
 
@@ -289,7 +252,7 @@ mod tests {
 	use std::sync::{Arc, Mutex};
 
 	use super::*;
-	use crate::{Completion, ModelInfo, Tool};
+	use crate::{Completion, ModelInfo, Tool, ToolSpec};
 
 	/// 台本どおりに Completion を返し、受け取ったリクエストを記録するプロバイダ。
 	struct Scripted {
@@ -363,7 +326,6 @@ mod tests {
 	}
 
 	struct Echo {
-		approval: bool,
 		runs: Arc<Mutex<u32>>,
 	}
 
@@ -371,10 +333,9 @@ mod tests {
 	impl Tool for Echo {
 		fn spec(&self) -> ToolSpec {
 			ToolSpec {
-				name: if self.approval { "danger" } else { "echo" }.into(),
+				name: "echo".into(),
 				description: "".into(),
 				input_schema: serde_json::json!({"type": "object"}),
-				requires_approval: self.approval,
 			}
 		}
 		async fn call(&self, args: serde_json::Value) -> ToolOutput {
@@ -385,11 +346,9 @@ mod tests {
 
 	#[derive(Default)]
 	struct Rec {
-		allow: bool,
 		events: Vec<String>,
 	}
 
-	#[async_trait::async_trait]
 	impl AgentHandler for Rec {
 		fn on_text(&mut self, t: &str) {
 			self.events.push(format!("text:{t}"));
@@ -400,21 +359,10 @@ mod tests {
 		fn on_tool_result(&mut self, c: &ToolCall, o: &ToolOutput) {
 			self.events.push(format!("result:{}:{}", c.name, o.is_error));
 		}
-		async fn approve(&mut self, _: &ToolCall, _: &ToolSpec) -> bool {
-			self.allow
-		}
 	}
 
 	fn registry(runs: &Arc<Mutex<u32>>) -> ToolRegistry {
-		ToolRegistry::new()
-			.with(Arc::new(Echo {
-				approval: false,
-				runs: runs.clone(),
-			}))
-			.with(Arc::new(Echo {
-				approval: true,
-				runs: runs.clone(),
-			}))
+		ToolRegistry::new().with(Arc::new(Echo { runs: runs.clone() }))
 	}
 
 	fn req() -> AgentRequest {
@@ -460,38 +408,6 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn approval_is_denied_by_default_and_error_is_fed_back() {
-		let runs = Arc::new(Mutex::new(0));
-		let p = Scripted::new(vec![turn("", vec![call("c1", "danger")]), turn("ok", vec![])]);
-		let mut h = Rec::default(); // allow = false
-		let out = run_agent(&p, &registry(&runs), &mut h, req()).await.unwrap();
-
-		assert_eq!(*runs.lock().unwrap(), 0, "拒否時は実行されない");
-		assert!(out.messages[2].content.starts_with("Error: denied"));
-		assert!(h.events.contains(&"result:danger:true".to_string()));
-
-		let runs = Arc::new(Mutex::new(0));
-		let p = Scripted::new(vec![turn("", vec![call("c1", "danger")]), turn("ok", vec![])]);
-		let mut h = Rec {
-			allow: true,
-			..Default::default()
-		};
-		run_agent(&p, &registry(&runs), &mut h, req()).await.unwrap();
-		assert_eq!(*runs.lock().unwrap(), 1);
-	}
-
-	#[tokio::test]
-	async fn auto_approve_skips_handler() {
-		let runs = Arc::new(Mutex::new(0));
-		let p = Scripted::new(vec![turn("", vec![call("c1", "danger")]), turn("ok", vec![])]);
-		let mut h = Rec::default(); // allow = false でも聞かれない
-		let mut r = req();
-		r.approval = ApprovalPolicy::AutoApprove;
-		run_agent(&p, &registry(&runs), &mut h, r).await.unwrap();
-		assert_eq!(*runs.lock().unwrap(), 1);
-	}
-
-	#[tokio::test]
 	async fn builtin_backend_wraps_run_agent() {
 		let runs = Arc::new(Mutex::new(0));
 		let backend: Arc<dyn AgentBackend> = Arc::new(BuiltinAgent::new(
@@ -502,7 +418,6 @@ mod tests {
 			registry(&runs),
 		));
 		assert_eq!(backend.name(), "builtin");
-		assert!(backend.asks_approval());
 		let out = backend.run(req(), &mut Rec::default()).await.unwrap();
 		assert_eq!((out.text.as_str(), out.steps), ("ok", 2));
 		assert_eq!(out.session_id, None);

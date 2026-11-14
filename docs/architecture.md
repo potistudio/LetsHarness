@@ -39,7 +39,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | 拡張点 | プラグインが実装する trait | Client から見える形 | 用途 |
 | --- | --- | --- | --- |
 | `provider` | `ProviderFactory` → `Provider` | `Host::provider(kind, cfg)` → `Arc<dyn Provider>` | LLM API。`create(cfg: Value)` でインスタンス化 |
-| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | 依頼を受けて最終回答まで自走する外部エージェント。途中経過と承認はプロセス間で往復する |
+| `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | 依頼を受けて最終回答まで自走する外部エージェント。途中経過はプロセス間で通知として流れる |
 | `tool` | `ToolFactory` → `Tool` | `Host::tools(cfg)` → `ToolRegistry` | エージェントが呼ぶツール。スキーマは MCP と同形 |
 | `boot` | `BootHook` | (Kernel が起動時に呼ぶ) | 返した環境変数が、以降に起動するプラグインの環境に足される |
 
@@ -98,7 +98,8 @@ path = "~/.letsharness/plugins/openai-compat"
 - すべてのプラグインは別プロセス。Rust の ABI で dylib を読み込むことはしない。プラグインがクラッシュしても kernel は巻き込まれない。
 - 運ぶ手段は **stdio (1行1メッセージの JSON-RPC 風)**。メッセージは `crates/kernel/src/rpc.rs`。
   - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。
-  - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。承認のようなプラグインから kernel への問い合わせも、同じ `req` を持つリクエスト。
+  - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。プラグインから kernel への問い合わせは、同じ `req` を持つリクエストとして扱う (プロトコル上の予約で、現在 `PluginServer` に送る API は無い)。
+  - 型の後方互換は保証しない。プラグインと kernel は同じバージョンでビルドする。
   - メソッド: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call`。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
