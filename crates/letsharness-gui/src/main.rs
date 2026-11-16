@@ -4,7 +4,6 @@
 //! 起動引数の `-o key=value` はそのまま Kernel とプロバイダに渡す。
 
 mod fonts;
-mod squircle;
 mod style;
 
 use std::sync::Arc;
@@ -16,7 +15,7 @@ use iced::widget::{
 	button, center, column, container, markdown, mouse_area, pick_list, row, scrollable, space, text, text_editor,
 };
 use iced::{Center, Element, Fill, Length, Size, window};
-use squircle::squircle;
+use iced_squircle::squircle;
 
 use letsharness_kernel::{BootConfig, ChatMessage, ChatOutput, Host, Kernel, Provider};
 

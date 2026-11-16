@@ -13,6 +13,7 @@ repository = "https://github.com/potistudio/LetsHarness"
 
 [workspace.dependencies]
 letsharness-kernel = { path = "crates/kernel" }
+iced-squircle = { path = "crates/iced-squircle" }
 
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }

@@ -1,0 +1,13 @@
+[package]
+name = "iced-squircle"
+description = "Squircle (superellipse-cornered) surfaces for iced."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+iced = { version = "0.14.0", features = ["canvas"] }

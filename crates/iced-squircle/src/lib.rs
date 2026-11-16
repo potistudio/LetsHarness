@@ -1,6 +1,23 @@
-//! Squircle (超楕円の角) の面。
+//! iced で Squircle (超楕円の角) の面を描くライブラリ。
 //!
 //! iced の `border.radius` は円弧の角しか描けないため、canvas で超楕円のパスを描いて中身の下に敷く。
+//!
+//! ```no_run
+//! use iced::widget::text;
+//! use iced::{Color, Element};
+//! use iced_squircle::{Surface, squircle};
+//!
+//! const CARD: Surface = Surface {
+//! 	radius: 12.0,
+//! 	fill: Color::WHITE,
+//! 	border: Some(Color::BLACK),
+//! 	shadow: None,
+//! };
+//!
+//! fn view<'a, Message: 'a>() -> Element<'a, Message> {
+//! 	squircle(text("Hello"), CARD)
+//! }
+//! ```
 
 use std::f32::consts::{FRAC_PI_2, PI};
 
@@ -84,7 +101,9 @@ impl<Message> canvas::Program<Message> for Shape {
 }
 
 /// `rect` を丸み `radius` ([`Surface::radius`]) の squircle にしたパス。
-fn path(rect: Rectangle, radius: f32) -> Path {
+///
+/// canvas で自前に描きたいとき用。
+pub fn path(rect: Rectangle, radius: f32) -> Path {
 	let r = (radius * EXTENT).min(rect.width / 2.0).min(rect.height / 2.0).max(0.0);
 	let (left, top) = (rect.x + r, rect.y + r);
 	let (right, bottom) = (rect.x + rect.width - r, rect.y + rect.height - r);

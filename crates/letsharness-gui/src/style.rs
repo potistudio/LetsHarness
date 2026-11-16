@@ -3,7 +3,7 @@
 use iced::widget::{button, column, container, markdown, pick_list, rich_text, scrollable, text, text_editor};
 use iced::{Background, Border, Color, Element, Fill, Font, Shadow, Theme, Vector, border, color, theme};
 
-use crate::squircle::{Surface, squircle};
+use iced_squircle::{Surface, squircle};
 
 pub const BG: Color = color!(0xFCFCFD);
 pub const SIDEBAR: Color = color!(0xF8F8F9);
