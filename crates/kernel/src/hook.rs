@@ -1,5 +1,5 @@
 //! Hook 拡張点: ループ ([`run_loop`](crate::run_loop)) の途中に割り込み、
-//! モデルへのリクエスト・ツール呼び出し・モデルの応答を書き換えたり止めたりする。
+//! モデルへのリクエスト・ツール呼び出しとその結果・モデルの応答を書き換えたり止めたりする。
 //!
 //! ループ自体は変えずに振る舞いを足すための口。複数の Hook は登録順に直列でつながり、
 //! 前の Hook の出力が次の Hook の入力になる。Hook が `Err` を返すとループはそこで止まる
@@ -21,6 +21,8 @@ pub enum HookPoint {
 	OnToolCall,
 	/// モデルの応答を受け取った直後 ([`Hook::after_response`])。
 	AfterResponse,
+	/// ツールの結果をモデルに返す直前 ([`Hook::after_tool_call`])。
+	AfterToolCall,
 }
 
 /// モデルへの1回分のリクエスト。
@@ -64,6 +66,12 @@ pub trait Hook: Send + Sync {
 	/// モデルの応答を受け取った直後。書き換えた応答が履歴に残り、ツール呼び出しもこれに従う。
 	async fn after_response(&self, completion: Completion) -> Result<Completion> {
 		Ok(completion)
+	}
+
+	/// ツールの結果をモデルに返す直前。`on_tool_call` で `Skip` された結果も来る。
+	/// `call` は実際に扱った呼び出し (`on_tool_call` で書き換えた後のもの)。
+	async fn after_tool_call(&self, _call: &ToolCall, output: ToolOutput) -> Result<ToolOutput> {
+		Ok(output)
 	}
 }
 
@@ -133,6 +141,14 @@ impl HookRegistry {
 			completion = hook.after_response(completion).await?;
 		}
 		Ok(completion)
+	}
+
+	/// [`Hook::after_tool_call`] を順に適用する。
+	pub async fn after_tool_call(&self, call: &ToolCall, mut output: ToolOutput) -> Result<ToolOutput> {
+		for hook in self.at(HookPoint::AfterToolCall) {
+			output = hook.after_tool_call(call, output).await?;
+		}
+		Ok(output)
 	}
 }
 

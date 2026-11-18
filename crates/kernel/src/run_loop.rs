@@ -44,7 +44,7 @@ pub struct LoopOutcome {
 /// モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答が出るまで繰り返す。
 ///
 /// kernel の責務。モデルは [`Provider`]、ツールは [`ToolRegistry`] で、どこのプラグインのものかは知らない。
-/// `hooks` はモデル呼び出しの前後とツール実行の前に割り込み、`Err` を返せばループはそこで止まる。
+/// `hooks` はモデル呼び出しの前後とツール実行の前後に割り込み、`Err` を返せばループはそこで止まる。
 pub async fn run_loop(
 	provider: &dyn Provider,
 	tools: &ToolRegistry,
@@ -119,6 +119,7 @@ pub async fn run_loop(
 		));
 		for call in &turn.tool_calls {
 			let (call, output) = execute(tools, hooks, handler, call.clone()).await?;
+			let output = hooks.after_tool_call(&call, output).await?;
 			handler.on_tool_result(&call, &output);
 			messages.push(ChatMessage::tool_result(&call.id, tool_result_text(&output)));
 		}
@@ -390,7 +391,7 @@ mod tests {
 	impl crate::Hook for Policy {
 		fn points(&self) -> Vec<crate::HookPoint> {
 			use crate::HookPoint::*;
-			vec![BeforeRequest, OnToolCall, AfterResponse]
+			vec![BeforeRequest, OnToolCall, AfterResponse, AfterToolCall]
 		}
 		async fn before_request(&self, mut req: ModelRequest) -> Result<ModelRequest> {
 			req.messages.insert(0, ChatMessage::system("policy"));
@@ -408,6 +409,10 @@ mod tests {
 		async fn after_response(&self, mut c: Completion) -> Result<Completion> {
 			c.text = format!("<{}>", c.text);
 			Ok(c)
+		}
+		async fn after_tool_call(&self, call: &ToolCall, mut out: ToolOutput) -> Result<ToolOutput> {
+			out.content = format!("{}#{}", out.content, call.name);
+			Ok(out)
 		}
 	}
 
@@ -428,9 +433,10 @@ mod tests {
 		assert_eq!(out.messages[0].role, "user");
 		// echo は書き換えた引数で実行され、deny は実行されずに結果が差し込まれる
 		assert_eq!(*runs.lock().unwrap(), 1);
-		assert_eq!(out.messages[2].content, r#"ran {"x":2}"#);
+		// after_tool_call は実行した結果にも Skip した結果にも効く
+		assert_eq!(out.messages[2].content, r#"ran {"x":2}#echo"#);
 		assert_eq!(out.messages[3].tool_call_id.as_deref(), Some("c2"));
-		assert_eq!(out.messages[3].content, "Error: denied by policy");
+		assert_eq!(out.messages[3].content, "Error: denied by policy#deny");
 		assert_eq!(
 			h.events,
 			[

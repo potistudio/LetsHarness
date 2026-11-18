@@ -96,12 +96,16 @@ impl Host {
 	}
 
 	/// Hook を提供するすべてのプラグインから Hook を集める。並びはプラグインの発見順 → manifest の記載順。
-	pub async fn hooks(&self, cfg: &Value) -> Result<HookRegistry> {
+	///
+	/// `tools` は同じループで使うツール。Hook はこれを見て設定を検証できる (存在しないツール名など)。
+	pub async fn hooks(&self, cfg: &Value, tools: &[ToolSpec]) -> Result<HookRegistry> {
 		let mut hooks = HookRegistry::new();
 		for entry in self.entries.iter().filter(|e| !e.manifest.contributes.hook.is_empty()) {
 			let conn = entry.connection().await?;
 			for kind in &entry.manifest.contributes.hook {
-				let created = conn.call("hook.create", json!({ "kind": kind, "cfg": cfg })).await?;
+				let created = conn
+					.call("hook.create", json!({ "kind": kind, "cfg": cfg, "tools": tools }))
+					.await?;
 				let instance = created
 					.get("instance")
 					.and_then(Value::as_u64)
@@ -135,7 +139,7 @@ impl Host {
 	) -> Result<LoopOutcome> {
 		let provider = self.provider(provider, cfg).await?;
 		let tools = self.tools(cfg).await?;
-		let hooks = self.hooks(cfg).await?;
+		let hooks = self.hooks(cfg, &tools.specs()).await?;
 		run_loop(&*provider, &tools, &hooks, handler, req).await
 	}
 
@@ -447,11 +451,9 @@ struct RemoteHook {
 }
 
 impl RemoteHook {
-	async fn rpc<R: DeserializeOwned>(&self, method: &str, key: &str, value: Value) -> Result<R> {
-		let v = self
-			.conn
-			.call(method, json!({ "instance": self.instance, key: value }))
-			.await?;
+	async fn rpc<R: DeserializeOwned>(&self, method: &str, mut params: Value) -> Result<R> {
+		params["instance"] = self.instance.into();
+		let v = self.conn.call(method, params).await?;
 		serde_json::from_value(v).map_err(|e| Error::plugin(self.conn.name(), e))
 	}
 }
@@ -464,21 +466,20 @@ impl Hook for RemoteHook {
 	}
 
 	async fn before_request(&self, req: ModelRequest) -> Result<ModelRequest> {
-		self.rpc("hook.before_request", "request", crate::dispatch::to_value(req)?)
-			.await
+		self.rpc("hook.before_request", json!({ "request": req })).await
 	}
 
 	async fn on_tool_call(&self, call: ToolCall) -> Result<ToolDecision> {
-		self.rpc("hook.on_tool_call", "call", crate::dispatch::to_value(call)?)
-			.await
+		self.rpc("hook.on_tool_call", json!({ "call": call })).await
 	}
 
 	async fn after_response(&self, completion: Completion) -> Result<Completion> {
-		self.rpc(
-			"hook.after_response",
-			"completion",
-			crate::dispatch::to_value(completion)?,
-		)
-		.await
+		self.rpc("hook.after_response", json!({ "completion": completion }))
+			.await
+	}
+
+	async fn after_tool_call(&self, call: &ToolCall, output: ToolOutput) -> Result<ToolOutput> {
+		self.rpc("hook.after_tool_call", json!({ "call": call, "output": output }))
+			.await
 	}
 }

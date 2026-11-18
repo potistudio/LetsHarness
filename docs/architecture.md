@@ -42,7 +42,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | `provider` | `ProviderFactory` → `Provider` | `Host::provider(kind, cfg)` → `Arc<dyn Provider>` | LLM API。`create(cfg: Value)` でインスタンス化 |
 | `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | ループもツールも自分で持って最終回答まで自走する外部エージェント。途中経過はプロセス間で通知として流れる |
 | `tool` | `ToolFactory` → `Tool` | `Host::tools(cfg)` → `ToolRegistry` | エージェントが呼ぶツール。スキーマは MCP と同形 |
-| `hook` | `HookFactory` → `Hook` | `Host::hooks(cfg)` → `HookRegistry` | ループに割り込む。モデル呼び出しの前後とツール実行の前に、リクエスト・ツール呼び出し・応答を書き換えたり止めたりする |
+| `hook` | `HookFactory` → `Hook` | `Host::hooks(cfg, tools)` → `HookRegistry` | ループに割り込む。モデル呼び出しとツール実行の前後で、リクエスト・応答・ツール呼び出し・結果を書き換えたり止めたりする |
 | `boot` | `BootHook` | (Kernel が起動時に呼ぶ) | 返した環境変数が、以降に起動するプラグインの環境に足される |
 
 ### Hook
@@ -54,11 +54,13 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | `before_request` | `ModelRequest` → `ModelRequest` | その1回のリクエストだけに効く。ループの履歴 (`LoopOutcome::messages`) には残らない |
 | `after_response` | `Completion` → `Completion` | 書き換えた応答が履歴に残り、ツール呼び出しもそれに従う |
 | `on_tool_call` | `ToolCall` → `ToolDecision` | `Run { call }` で (書き換えて) 実行、`Skip { output }` で実行せず結果を差し込む。`call.id` は書き換えても元に戻る |
+| `after_tool_call` | `(ToolCall, ToolOutput)` → `ToolOutput` | モデルに返す結果を書き換える (伏せ字・切り詰めなど)。`Skip` で差し込んだ結果にも効く |
 
 - 複数の Hook は直列につながり、前の出力が次の入力になる。順はプラグインの発見順 → manifest の `contributes.hook` の記載順。`on_tool_call` は最初の `Skip` で止まる。
 - Hook は `points()` で割り込む箇所を宣言し、挙げた箇所だけが呼ばれる (割り込まない Hook のためにプロセス間で履歴を往復させない)。設定次第で何もしないなら空を返す。
 - Hook が `Err` を返すと (通信の失敗も含めて) ループはそこで止まる。ツールの失敗と違ってモデルには見せない。ポリシーを黙って素通りさせないため。
-- `cfg` はツールと同じくループに渡る設定 (`-o key=value` と `workdir`)。例: `hook-guard` は `-o deny_tools=bash,write_file` のツールを `Skip` する。
+- `cfg` はツールと同じくループに渡る設定 (`-o key=value` と `workdir`)。`create` には同じループで使うツールの一覧も渡るので、設定の食い違い (存在しないツール名など) は `Err(Config)` で起動時に止める。黙って無視しない。
+- 例: `hook-guard` は `-o deny_tools=bash,write_file` のツールを `Skip` し、知らないツール名なら起動を止める。
 
 ## Provider / Loop / Agent
 
@@ -122,7 +124,7 @@ path = "~/.letsharness/plugins/openai-compat"
   - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。向きは kernel → プラグインのみ。
   - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。
   - 型の後方互換は保証しない。プラグインと kernel は同じバージョンでビルドする。
-  - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call` / `hook.create` / `hook.before_request` / `hook.on_tool_call` / `hook.after_response`。
+  - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call` / `hook.create` / `hook.before_request` / `hook.on_tool_call` / `hook.after_response` / `hook.after_tool_call`。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
 - Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。
@@ -131,7 +133,7 @@ path = "~/.letsharness/plugins/openai-compat"
 
 1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。設定ファイル (`default_provider` / `[providers.x]`) を導入する。いまの `Provider` は多数のメソッドを持ち、そのまま線の上を流れている。
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
-3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` (Client が直接 `chat` するときにも Hook を効かせる) は未着手。
+3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` (Client が直接 `chat` するときにも Hook を効かせる) は未着手。
 4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) は実装済み。
 5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。

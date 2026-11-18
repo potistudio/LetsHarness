@@ -21,7 +21,7 @@ use crate::dispatch::{call_provider, field, to_value};
 use crate::rpc::{Frame, WireError};
 use crate::{
 	AgentBackend, AgentRequest, Completion, Error, Hook, ModelRequest, Provider, Result, RunHandler, Tool, ToolCall,
-	ToolOutput,
+	ToolOutput, ToolSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,7 +66,8 @@ pub trait HookFactory: Send + Sync {
 	fn name(&self) -> &'static str;
 
 	/// `cfg` はループに渡る設定 (`-o key=value` と `workdir`)。割り込まないなら `points()` が空の Hook を返す。
-	fn create(&self, cfg: &Value) -> Result<Arc<dyn Hook>>;
+	/// `tools` は同じループで使うツール。設定がこれと食い違うなら `Err(Config)` で起動を止める。
+	fn create(&self, cfg: &Value, tools: &[ToolSpec]) -> Result<Arc<dyn Hook>>;
 }
 
 /// 起動時に呼ばれ、以降に起動するプラグインへ渡す環境変数を返す。
@@ -292,7 +293,8 @@ impl Inner {
 					.iter()
 					.find(|f| f.name() == kind)
 					.ok_or_else(|| Error::Config(format!("unknown hook: {kind}")))?;
-				let hook = factory.create(params.get("cfg").unwrap_or(&Value::Null))?;
+				let tools: Vec<ToolSpec> = field::<Option<Vec<ToolSpec>>>(&params, "tools")?.unwrap_or_default();
+				let hook = factory.create(params.get("cfg").unwrap_or(&Value::Null), &tools)?;
 				let (id, points) = (self.instance_id(), hook.points());
 				self.hooks.lock().unwrap().insert(id, hook);
 				Ok(json!({ "instance": id, "points": points }))
@@ -313,6 +315,10 @@ impl Inner {
 					"on_tool_call" => to_value(hook.on_tool_call(field::<ToolCall>(&params, "call")?).await?),
 					"after_response" => {
 						to_value(hook.after_response(field::<Completion>(&params, "completion")?).await?)
+					}
+					"after_tool_call" => {
+						let call = field::<ToolCall>(&params, "call")?;
+						to_value(hook.after_tool_call(&call, field(&params, "output")?).await?)
 					}
 					other => Err(Error::Unsupported(format!("hook.{other}"))),
 				}

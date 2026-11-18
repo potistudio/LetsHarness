@@ -2,11 +2,13 @@
 //!
 //! `-o deny_tools=bash,write_file` (カンマ区切り、または JSON 配列) で指定する。
 //! 止めた呼び出しはエラー結果としてモデルに返るので、モデルは別の手段を選べる。
-//! 指定が無ければどこにも割り込まない。
+//! 指定が無ければどこにも割り込まない。存在しないツール名を指定すると、打ち間違いを見逃さないよう起動を止める。
 
 use std::sync::Arc;
 
-use letsharness_kernel::{Hook, HookFactory, HookPoint, PluginServer, Result, ToolCall, ToolDecision, ToolOutput};
+use letsharness_kernel::{
+	Error, Hook, HookFactory, HookPoint, PluginServer, Result, ToolCall, ToolDecision, ToolOutput, ToolSpec,
+};
 use serde_json::Value;
 
 pub fn server() -> PluginServer {
@@ -20,10 +22,16 @@ impl HookFactory for GuardFactory {
 		"guard"
 	}
 
-	fn create(&self, cfg: &Value) -> Result<Arc<dyn Hook>> {
-		Ok(Arc::new(Guard {
-			deny: deny_list(cfg.get("deny_tools")),
-		}))
+	fn create(&self, cfg: &Value, tools: &[ToolSpec]) -> Result<Arc<dyn Hook>> {
+		let deny = deny_list(cfg.get("deny_tools"));
+		if let Some(unknown) = deny.iter().find(|n| !tools.iter().any(|t| &t.name == *n)) {
+			let known: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+			return Err(Error::Config(format!(
+				"deny_tools: unknown tool `{unknown}` ({})",
+				known.join("|")
+			)));
+		}
+		Ok(Arc::new(Guard { deny }))
 	}
 }
 
@@ -71,10 +79,24 @@ mod tests {
 
 	use super::*;
 
+	fn tools(names: &[&str]) -> Vec<ToolSpec> {
+		names
+			.iter()
+			.map(|n| ToolSpec {
+				name: (*n).into(),
+				description: String::new(),
+				input_schema: json!({"type": "object"}),
+			})
+			.collect()
+	}
+
 	#[tokio::test]
 	async fn blocks_only_denied_tools() {
 		let guard = GuardFactory
-			.create(&json!({ "deny_tools": "bash, write_file" }))
+			.create(
+				&json!({ "deny_tools": "bash, write_file" }),
+				&tools(&["bash", "write_file", "read_file"]),
+			)
 			.unwrap();
 		assert_eq!(guard.points(), [HookPoint::OnToolCall]);
 
@@ -93,8 +115,19 @@ mod tests {
 
 	#[test]
 	fn idle_without_deny_tools() {
-		assert!(GuardFactory.create(&json!({})).unwrap().points().is_empty());
-		let from_array = GuardFactory.create(&json!({ "deny_tools": ["bash"] })).unwrap();
+		assert!(GuardFactory.create(&json!({}), &[]).unwrap().points().is_empty());
+		let from_array = GuardFactory
+			.create(&json!({ "deny_tools": ["bash"] }), &tools(&["bash"]))
+			.unwrap();
 		assert_eq!(from_array.points(), [HookPoint::OnToolCall]);
+	}
+
+	#[test]
+	fn unknown_tool_names_fail_loud() {
+		let err = GuardFactory
+			.create(&json!({ "deny_tools": "bsah" }), &tools(&["bash"]))
+			.err()
+			.expect("typo must be rejected");
+		assert_eq!(err.to_string(), "config: deny_tools: unknown tool `bsah` (bash)");
 	}
 }

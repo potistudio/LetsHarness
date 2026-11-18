@@ -178,6 +178,27 @@ fn hook_plugin_blocks_a_tool_call() {
 }
 
 #[test]
+fn hook_config_is_validated_against_the_tools() {
+	let out = letsharness(&[
+		"--provider",
+		"mock",
+		"-o",
+		"deny_tools=no_such_tool",
+		"loop",
+		"--model",
+		"m",
+		"--prompt",
+		"hi",
+	]);
+	assert!(!out.status.success());
+	assert!(
+		stderr(&out).contains("deny_tools: unknown tool `no_such_tool`"),
+		"{}",
+		stderr(&out)
+	);
+}
+
+#[test]
 fn dotenv_boot_options_are_validated() {
 	let out = letsharness(&[
 		"--provider",
