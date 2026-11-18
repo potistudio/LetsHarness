@@ -63,6 +63,9 @@ pub struct Contributes {
 	/// `Hook` の名前。ループに割り込む順は、プラグインの発見順 → ここに並べた順。
 	#[serde(default)]
 	pub hook: Vec<String>,
+	/// `Observer` の名前。
+	#[serde(default)]
+	pub observer: Vec<String>,
 }
 
 impl Manifest {
@@ -253,6 +256,14 @@ impl Connection {
 		}
 		self.send(Frame::request(id, method, params)).await?;
 		Ok(call)
+	}
+
+	/// 応答を待たない通知を送る (Kernel → プラグイン)。
+	pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
+		if let Some(reason) = &self.state.lock().unwrap().closed {
+			return Err(Error::plugin(self.name, reason.clone()));
+		}
+		self.send(Frame::notify(method, params)).await
 	}
 
 	/// 途中経過のない呼び出し。

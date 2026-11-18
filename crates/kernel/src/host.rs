@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::external::{Connection, EventSink, NoEvents, PluginEntry};
 use crate::{
-	AgentBackend, AgentOutcome, AgentRequest, ChatMessage, ChatOutput, Completion, Error, Hook, HookPoint,
-	HookRegistry, LoopOutcome, LoopRequest, ModelInfo, ModelRequest, Provider, Quota, Result, RunHandler, Tool,
-	ToolCall, ToolDecision, ToolOutput, ToolRegistry, ToolSpec, run_loop,
+	AgentBackend, AgentOutcome, AgentRequest, ChatMessage, ChatOutput, Completion, Error, Event, Hook, HookPoint,
+	HookRegistry, LoopOutcome, LoopRequest, ModelInfo, ModelRequest, Observer, Provider, Quota, Result, RunHandler,
+	Tool, ToolCall, ToolDecision, ToolOutput, ToolRegistry, ToolSpec, run_loop,
 };
 
 pub struct Host {
@@ -127,6 +128,27 @@ impl Host {
 		self.kinds(|c| &c.hook)
 	}
 
+	/// Observer を提供するすべてのプラグインから Observer を集める。設定次第で見ないものは含まない。
+	pub async fn observers(&self, cfg: &Value) -> Result<Vec<Arc<dyn Observer>>> {
+		let mut observers: Vec<Arc<dyn Observer>> = Vec::new();
+		for entry in self
+			.entries
+			.iter()
+			.filter(|e| !e.manifest.contributes.observer.is_empty())
+		{
+			let conn = entry.connection().await?;
+			for kind in &entry.manifest.contributes.observer {
+				let created = conn
+					.call("observer.create", json!({ "kind": kind, "cfg": cfg }))
+					.await?;
+				if let Some(instance) = created.get("instance").and_then(Value::as_u64) {
+					observers.push(Arc::new(RemoteObserver::spawn(conn.clone(), instance)));
+				}
+			}
+		}
+		Ok(observers)
+	}
+
 	/// `provider` のモデルと、すべてのツール・Hook でループを回す ([`run_loop`])。
 	///
 	/// ループは kernel の責務で、モデルもツールも Hook も `Host` が引いたものをそのまま使う。
@@ -139,8 +161,13 @@ impl Host {
 	) -> Result<LoopOutcome> {
 		let provider = self.provider(provider, cfg).await?;
 		let tools = self.tools(cfg).await?;
-		let hooks = self.hooks(cfg, &tools.specs()).await?;
-		run_loop(&*provider, &tools, &hooks, handler, req).await
+		let mut hooks = self.hooks(cfg, &tools.specs()).await?;
+		for observer in self.observers(cfg).await? {
+			hooks.observe(observer);
+		}
+		let out = run_loop(&*provider, &tools, &hooks, handler, req).await;
+		hooks.flush().await;
+		out
 	}
 
 	fn kinds<'a>(&'a self, pick: impl Fn(&'a crate::external::Contributes) -> &'a Vec<String>) -> Vec<&'a str> {
@@ -481,5 +508,66 @@ impl Hook for RemoteHook {
 	async fn after_tool_call(&self, call: &ToolCall, output: ToolOutput) -> Result<ToolOutput> {
 		self.rpc("hook.after_tool_call", json!({ "call": call, "output": output }))
 			.await
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Observer
+// ---------------------------------------------------------------------------
+
+enum Outbox {
+	/// 送る時点ではなく起きた時点の値を送るため、受け取ったときに JSON にしておく。
+	Event(Value),
+	Flush(oneshot::Sender<()>),
+}
+
+/// 出来事を順に通知として送る。ループは送信を待たない。
+///
+/// 送れなかった出来事は警告して捨てる (見るだけの口なので、ループは止めない)。
+struct RemoteObserver {
+	tx: mpsc::UnboundedSender<Outbox>,
+}
+
+impl RemoteObserver {
+	fn spawn(conn: Arc<Connection>, instance: u64) -> Self {
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		tokio::spawn(async move {
+			while let Some(item) = rx.recv().await {
+				let sent = match item {
+					Outbox::Event(event) => {
+						conn.notify("observer.event", json!({ "instance": instance, "event": event }))
+							.await
+					}
+					Outbox::Flush(done) => {
+						let flushed = conn.call("observer.flush", json!({ "instance": instance })).await;
+						let _ = done.send(());
+						flushed.map(drop)
+					}
+				};
+				if let Err(e) = sent {
+					eprintln!("warning: observer: {e}");
+				}
+			}
+		});
+		Self { tx }
+	}
+}
+
+#[async_trait::async_trait]
+impl Observer for RemoteObserver {
+	fn on_event(&self, event: &Event) {
+		match serde_json::to_value(event) {
+			Ok(event) => {
+				let _ = self.tx.send(Outbox::Event(event));
+			}
+			Err(e) => eprintln!("warning: observer: {e}"),
+		}
+	}
+
+	async fn flush(&self) {
+		let (done, wait) = oneshot::channel();
+		if self.tx.send(Outbox::Flush(done)).is_ok() {
+			let _ = wait.await;
+		}
 	}
 }

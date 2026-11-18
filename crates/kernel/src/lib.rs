@@ -15,6 +15,7 @@ mod handler;
 mod hook;
 mod host;
 mod kernel;
+mod observe;
 mod rpc;
 mod run_loop;
 mod serve;
@@ -26,8 +27,11 @@ pub use handler::{DEFAULT_MAX_STEPS, RunHandler};
 pub use hook::{Hook, HookPoint, HookRegistry, ModelRequest, ToolDecision};
 pub use host::Host;
 pub use kernel::{BootConfig, Kernel};
+pub use observe::{Event, Observer};
 pub use run_loop::{LoopOutcome, LoopRequest, run_loop};
-pub use serve::{AgentBackendFactory, BootHook, HookFactory, PluginServer, ProviderFactory, ToolFactory};
+pub use serve::{
+	AgentBackendFactory, BootHook, HookFactory, ObserverFactory, PluginServer, ProviderFactory, ToolFactory,
+};
 pub use tool::{Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
 // ---------------------------------------------------------------------------

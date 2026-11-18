@@ -13,6 +13,7 @@ const PLUGINS: &[&str] = &[
 	"letsharness-plugin-dotenv",
 	"letsharness-agent-antigravity",
 	"letsharness-hook-guard",
+	"letsharness-observer-log",
 ];
 
 fn plugin_dir() -> PathBuf {
@@ -196,6 +197,40 @@ fn hook_config_is_validated_against_the_tools() {
 		"{}",
 		stderr(&out)
 	);
+}
+
+/// 外部プラグインの Observer に、ループの出来事が起きた順で届く。
+#[test]
+fn observer_plugin_sees_loop_events_in_order() {
+	let dir = std::env::temp_dir().join(format!("lh-e2e-observer-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let log = dir.join("events.jsonl");
+	let out = letsharness(&[
+		"--provider",
+		"mock",
+		"-o",
+		&format!("event_log={}", log.display()),
+		"loop",
+		"--model",
+		"m",
+		"--prompt",
+		r#"tool:list_dir {"path":"."}"#,
+		"--workdir",
+		dir.to_str().unwrap(),
+	]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	let text = std::fs::read_to_string(&log).unwrap();
+	let kinds: Vec<String> = text
+		.lines()
+		.map(|l| {
+			serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
+				.as_str()
+				.unwrap()
+				.to_owned()
+		})
+		.collect();
+	assert_eq!(kinds, ["request", "response", "tool_result", "request", "response"]);
+	std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

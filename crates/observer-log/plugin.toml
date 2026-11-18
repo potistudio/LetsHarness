@@ -1,0 +1,5 @@
+name = "event-log"
+command = "letsharness-observer-log"
+
+[contributes]
+observer = ["event-log"]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ChatMessage, Completion, Result, ToolCall, ToolOutput, ToolSpec};
+use crate::{ChatMessage, Completion, Event, Observer, Result, ToolCall, ToolOutput, ToolSpec};
 
 /// Hook が割り込める箇所。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,9 +76,12 @@ pub trait Hook: Send + Sync {
 }
 
 /// Hook を登録順に保持し、箇所ごとに直列で適用する。
+///
+/// [`Observer`] も持ち、各箇所で Hook をすべて通した後の値を [`Event`] として渡す。
 #[derive(Clone, Default)]
 pub struct HookRegistry {
 	hooks: Vec<(Vec<HookPoint>, Arc<dyn Hook>)>,
+	observers: Vec<Arc<dyn Observer>>,
 }
 
 impl HookRegistry {
@@ -97,6 +100,30 @@ impl HookRegistry {
 		self
 	}
 
+	/// Observer を末尾に登録する。
+	pub fn observe(&mut self, observer: Arc<dyn Observer>) -> &mut Self {
+		self.observers.push(observer);
+		self
+	}
+
+	/// Observer がそれまでの出来事を処理し終えるまで待つ。
+	pub async fn flush(&self) {
+		for observer in &self.observers {
+			observer.flush().await;
+		}
+	}
+
+	fn emit(&self, event: impl FnOnce() -> Event) {
+		if self.observers.is_empty() {
+			return;
+		}
+		let event = event();
+		for observer in &self.observers {
+			observer.on_event(&event);
+		}
+	}
+
+	/// Hook の数 (Observer は含まない)。
 	pub fn is_empty(&self) -> bool {
 		self.hooks.is_empty()
 	}
@@ -117,6 +144,7 @@ impl HookRegistry {
 		for hook in self.at(HookPoint::BeforeRequest) {
 			req = hook.before_request(req).await?;
 		}
+		self.emit(|| Event::Request { request: req.clone() });
 		Ok(req)
 	}
 
@@ -140,6 +168,9 @@ impl HookRegistry {
 		for hook in self.at(HookPoint::AfterResponse) {
 			completion = hook.after_response(completion).await?;
 		}
+		self.emit(|| Event::Response {
+			completion: completion.clone(),
+		});
 		Ok(completion)
 	}
 
@@ -148,6 +179,10 @@ impl HookRegistry {
 		for hook in self.at(HookPoint::AfterToolCall) {
 			output = hook.after_tool_call(call, output).await?;
 		}
+		self.emit(|| Event::ToolResult {
+			call: call.clone(),
+			output: output.clone(),
+		});
 		Ok(output)
 	}
 }
@@ -233,6 +268,31 @@ mod tests {
 			.unwrap();
 		assert!(matches!(decision, ToolDecision::Skip { output } if output.is_error && output.content == "blocked"));
 		assert!(seen.lock().unwrap().is_empty());
+	}
+
+	#[derive(Default)]
+	struct Rec(Mutex<Vec<Event>>);
+
+	impl Observer for Rec {
+		fn on_event(&self, event: &Event) {
+			self.0.lock().unwrap().push(event.clone());
+		}
+	}
+
+	#[tokio::test]
+	async fn observers_see_values_after_every_hook() {
+		let rec = Arc::new(Rec::default());
+		let mut hooks = HookRegistry::new().with(Arc::new(Block));
+		hooks.observe(rec.clone());
+		let call = ToolCall::new("c1", "echo", json!({}));
+		let ToolDecision::Skip { output } = hooks.on_tool_call(call.clone()).await.unwrap() else {
+			panic!("should skip");
+		};
+		hooks.after_tool_call(&call, output).await.unwrap();
+		let events = rec.0.lock().unwrap();
+		assert_eq!(events.len(), 1);
+		assert!(matches!(&events[0], Event::ToolResult { output, .. } if output.content == "blocked"));
+		assert_eq!(hooks.len(), 1, "observers are not hooks");
 	}
 
 	#[test]

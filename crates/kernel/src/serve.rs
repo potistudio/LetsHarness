@@ -20,8 +20,8 @@ use tokio::sync::mpsc;
 use crate::dispatch::{call_provider, field, to_value};
 use crate::rpc::{Frame, WireError};
 use crate::{
-	AgentBackend, AgentRequest, Completion, Error, Hook, ModelRequest, Provider, Result, RunHandler, Tool, ToolCall,
-	ToolOutput, ToolSpec,
+	AgentBackend, AgentRequest, Completion, Error, Event, Hook, ModelRequest, Observer, Provider, Result, RunHandler,
+	Tool, ToolCall, ToolOutput, ToolSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,15 @@ pub trait HookFactory: Send + Sync {
 	fn create(&self, cfg: &Value, tools: &[ToolSpec]) -> Result<Arc<dyn Hook>>;
 }
 
+/// ループの出来事を見る [`Observer`] の供給元。
+pub trait ObserverFactory: Send + Sync {
+	/// manifest の `contributes.observer` と一致させる。
+	fn name(&self) -> &'static str;
+
+	/// `cfg` はループに渡る設定。見ないなら `None` (出来事は送られてこない)。
+	fn create(&self, cfg: &Value) -> Result<Option<Arc<dyn Observer>>>;
+}
+
 /// 起動時に呼ばれ、以降に起動するプラグインへ渡す環境変数を返す。
 pub trait BootHook: Send + Sync {
 	/// `options` は `-o key=value` を集めた JSON オブジェクト。
@@ -87,6 +96,7 @@ pub struct PluginServer {
 	agents: Vec<Arc<dyn AgentBackendFactory>>,
 	tools: Vec<Arc<dyn ToolFactory>>,
 	hooks: Vec<Arc<dyn HookFactory>>,
+	observers: Vec<Arc<dyn ObserverFactory>>,
 }
 
 impl PluginServer {
@@ -119,6 +129,11 @@ impl PluginServer {
 		self
 	}
 
+	pub fn observer(mut self, factory: impl ObserverFactory + 'static) -> Self {
+		self.observers.push(Arc::new(factory));
+		self
+	}
+
 	/// stdin が閉じるまで Kernel からの呼び出しに答える。
 	pub async fn serve(self) {
 		let (out, mut out_rx) = mpsc::unbounded_channel::<Frame>();
@@ -130,6 +145,7 @@ impl PluginServer {
 			agents: Mutex::new(HashMap::new()),
 			tools: Mutex::new(HashMap::new()),
 			hooks: Mutex::new(HashMap::new()),
+			observers: Mutex::new(HashMap::new()),
 		});
 
 		let writer = tokio::spawn(async move {
@@ -150,17 +166,22 @@ impl PluginServer {
 			let Ok(frame) = serde_json::from_str::<Frame>(&line) else {
 				continue;
 			};
-			// Kernel からのリクエスト。長い呼び出しの最中も他を受けられるよう別タスクで処理する。
-			if let (Some(id), Some(method)) = (frame.id, frame.method) {
-				let inner = inner.clone();
-				let params = frame.params.unwrap_or(Value::Null);
-				tokio::spawn(async move {
-					let reply = match inner.dispatch(&method, params).await {
-						Ok(v) => Frame::ok(id, v),
-						Err(e) => Frame::err(id, WireError::from(&e)),
-					};
-					let _ = inner.out.send(reply);
-				});
+			match (frame.id, frame.method) {
+				// Kernel からのリクエスト。長い呼び出しの最中も他を受けられるよう別タスクで処理する。
+				(Some(id), Some(method)) => {
+					let inner = inner.clone();
+					let params = frame.params.unwrap_or(Value::Null);
+					tokio::spawn(async move {
+						let reply = match inner.dispatch(&method, params).await {
+							Ok(v) => Frame::ok(id, v),
+							Err(e) => Frame::err(id, WireError::from(&e)),
+						};
+						let _ = inner.out.send(reply);
+					});
+				}
+				// Kernel からの通知 (Observer への出来事)。届いた順に処理するので、この後のリクエストより先に終わる。
+				(None, Some(method)) => inner.notified(&method, frame.params.unwrap_or(Value::Null)),
+				_ => {}
 			}
 		}
 		drop(inner);
@@ -176,6 +197,7 @@ struct Inner {
 	agents: Mutex<HashMap<u64, Arc<dyn AgentBackend>>>,
 	tools: Mutex<HashMap<u64, Arc<dyn Tool>>>,
 	hooks: Mutex<HashMap<u64, Arc<dyn Hook>>>,
+	observers: Mutex<HashMap<u64, Arc<dyn Observer>>>,
 }
 
 impl Inner {
@@ -186,6 +208,29 @@ impl Inner {
 	fn notify(&self, method: &str, req: u64, mut params: Value) {
 		params["req"] = req.into();
 		let _ = self.out.send(Frame::notify(method, params));
+	}
+
+	fn notified(&self, method: &str, params: Value) {
+		let result = match method {
+			"observer.event" => self.observer(&params).and_then(|observer| {
+				observer.on_event(&field::<Event>(&params, "event")?);
+				Ok(())
+			}),
+			other => Err(Error::Unsupported(other.to_owned())),
+		};
+		if let Err(e) = result {
+			eprintln!("warning: {method}: {e}");
+		}
+	}
+
+	fn observer(&self, params: &Value) -> Result<Arc<dyn Observer>> {
+		let instance: u64 = field(params, "instance")?;
+		self.observers
+			.lock()
+			.unwrap()
+			.get(&instance)
+			.cloned()
+			.ok_or_else(|| Error::Config(format!("unknown observer instance: {instance}")))
 	}
 
 	async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
@@ -322,6 +367,25 @@ impl Inner {
 					}
 					other => Err(Error::Unsupported(format!("hook.{other}"))),
 				}
+			}
+			"observer.create" => {
+				let kind: String = field(&params, "kind")?;
+				let factory = self
+					.server
+					.observers
+					.iter()
+					.find(|f| f.name() == kind)
+					.ok_or_else(|| Error::Config(format!("unknown observer: {kind}")))?;
+				let Some(observer) = factory.create(params.get("cfg").unwrap_or(&Value::Null))? else {
+					return Ok(json!({ "instance": null }));
+				};
+				let id = self.instance_id();
+				self.observers.lock().unwrap().insert(id, observer);
+				Ok(json!({ "instance": id }))
+			}
+			"observer.flush" => {
+				self.observer(&params)?.flush().await;
+				Ok(json!({}))
 			}
 			other => Err(Error::Unsupported(other.to_owned())),
 		}
