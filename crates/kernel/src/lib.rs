@@ -15,6 +15,7 @@ mod external;
 mod handler;
 mod hook;
 mod host;
+mod install;
 mod kernel;
 mod observe;
 mod profile;
@@ -32,6 +33,7 @@ pub use external::{Contributes, MANIFEST_FILE, Manifest};
 pub use handler::{DEFAULT_MAX_STEPS, RunHandler};
 pub use hook::{Hook, HookPoint, HookRegistry, ModelRequest, ToolDecision};
 pub use host::Host;
+pub use install::{Installed, install, plugins_dir, uninstall};
 pub use kernel::{BootConfig, Kernel};
 pub use observe::{Event, Observer};
 pub use profile::{

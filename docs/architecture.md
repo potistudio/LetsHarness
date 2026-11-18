@@ -123,7 +123,17 @@ async fn main() {
 }
 ```
 
-発見先 (`BootConfig::plugin_path`) は `$LETSHARNESS_PLUGIN_PATH` → 実行ファイル横の `plugins/` → `~/.letsharness/plugins`。各ディレクトリの直下 `*/plugin.toml` を読む。そのうえで [パッチ層](#profile-とパッチ層) を重ねる。
+発見先 (`BootConfig::plugin_path`) は `$LETSHARNESS_PLUGIN_PATH` → 実行ファイル横の `plugins/` → `<home>/plugins`。各ディレクトリの直下 `*/plugin.toml` を読む。同じ名前は先に見つかったものを使い、後のディレクトリのものは黙って隠れる (同じディレクトリの中での重複は警告する)。そのうえで [パッチ層](#profile-とパッチ層) を重ねる。
+
+### 導入
+
+`letsharness plugin install <SRC>` は `plugin.toml` と実行ファイルを `<home>/plugins/<name>/` に写す (`cargo xtask install` に当たる)。
+
+- `SRC` はプラグイン1つのディレクトリ (`plugin.toml` がある) か、それが並んだディレクトリ (直下の `*/plugin.toml` をすべて)。リポジトリでは `cargo build --workspace --release` の後に `cargo run --release -- plugin install crates` で全部入る。
+- 実行ファイルは起動時と同じ順 (manifest のディレクトリ → kernel の実行ファイルと同じ場所) に探して写し、写した先の `plugin.toml` の `command` をそのファイル名にする。`PATH` にしか無いものは写さない。ビルドはしない。
+- すでに入っている名前は `--force` が無ければ止める。実行ファイルが1つでも見つからなければ何も書かない。
+- 先に見つかる同じ名前のプラグイン (`$LETSHARNESS_PLUGIN_PATH` の `crates/` など) に隠れるときは警告する。
+- `letsharness plugin uninstall <name>` は `<home>/plugins` の中で manifest の名前が一致するディレクトリだけを消す。
 開発中は `.cargo/config.toml` が `LETSHARNESS_PLUGIN_PATH=crates` を設定するので、`cargo build --workspace` したあと `cargo run -p letsharness -- ...` でそのまま動く。
 
 ## Configuration
@@ -220,7 +230,7 @@ config.mcp_servers.docs = { type = "http", url = "https://example.com/mcp", head
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
 3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` も実装済みで、`chat` / GUI にも Hook と Observer が効く。会話の履歴は `Session` が持ち、セッションログから `--resume` で再開できる。
 4. **完了**: MCP クライアント (`crates/tool-mcp`、stdio / Streamable HTTP)。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) も実装済み。
-5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。profile とパッチ層 (有効/無効・並び順・プラグインごとの設定・`path` での追加) と `letsharness plugin list/enable/disable` は実装済み。
+5. **完了**: プラグインの配布。`letsharness plugin install/uninstall` (`<home>/plugins` への導入)、profile とパッチ層 (有効/無効・並び順・プラグインごとの設定・`path` での追加)、`letsharness plugin list/enable/disable`。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
 
 ## Diagrams

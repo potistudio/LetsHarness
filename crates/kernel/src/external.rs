@@ -96,25 +96,46 @@ impl Manifest {
 		Ok(m)
 	}
 
+	/// 起動するもの。見つからない名前だけのものは `PATH` に任せ、パス付きのものはそのまま (起動時にエラーになる)。
 	fn resolve_command(&self) -> PathBuf {
+		self.local_command().unwrap_or_else(|| {
+			let c = Path::new(&self.command);
+			if c.is_absolute() || c.components().count() > 1 {
+				self.dir.join(c)
+			} else {
+				c.to_path_buf()
+			}
+		})
+	}
+
+	/// `command` のファイル (パス付きなら manifest のディレクトリから、名前だけなら manifest のディレクトリ →
+	/// Kernel の実行ファイルと同じ場所)。見つからなければ `None` (名前だけなら起動時は `PATH` から探す)。
+	pub fn local_command(&self) -> Option<PathBuf> {
 		let c = Path::new(&self.command);
 		if c.is_absolute() || c.components().count() > 1 {
-			return self.dir.join(c);
+			let path = self.dir.join(c);
+			return path.is_file().then_some(path);
 		}
 		let exe_dir = std::env::current_exe()
 			.ok()
 			.and_then(|p| p.parent().map(Path::to_path_buf));
-		for dir in std::iter::once(self.dir.clone()).chain(exe_dir) {
-			let candidate = dir.join(c);
-			if candidate.is_file() {
-				return candidate;
-			}
-		}
-		c.to_path_buf()
+		std::iter::once(self.dir.clone())
+			.chain(exe_dir)
+			.map(|dir| dir.join(c))
+			.find(|candidate| candidate.is_file())
+	}
+
+	/// `command` が名前だけで、`PATH` にある。
+	pub fn on_path(&self) -> bool {
+		let c = Path::new(&self.command);
+		c.components().count() == 1
+			&& !c.is_absolute()
+			&& std::env::var_os("PATH")
+				.is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(c).is_file()))
 	}
 }
 
-/// 既定の探索先: `$LETSHARNESS_PLUGIN_PATH` → 実行ファイル横の `plugins/` → `~/.letsharness/plugins`。
+/// 既定の探索先: `$LETSHARNESS_PLUGIN_PATH` → 実行ファイル横の `plugins/` → `<home>/plugins` (`plugin install` の導入先)。
 pub fn default_plugin_path() -> Vec<PathBuf> {
 	let mut dirs: Vec<PathBuf> = std::env::var_os("LETSHARNESS_PLUGIN_PATH")
 		.map(|v| std::env::split_paths(&v).collect())
@@ -125,17 +146,18 @@ pub fn default_plugin_path() -> Vec<PathBuf> {
 	{
 		dirs.push(dir);
 	}
-	if let Some(home) = std::env::var_os("HOME") {
-		dirs.push(PathBuf::from(home).join(".letsharness/plugins"));
-	}
+	dirs.extend(crate::install::plugins_dir());
 	dirs
 }
 
 /// `dirs` の直下 (`<dir>/*/plugin.toml`) から manifest を集める。壊れたものは警告して飛ばす。
-/// 同じ `name` は先に見つかったものを使う。
+///
+/// 同じ `name` は先に見つかったものを使う。後のディレクトリにあるものは黙って隠れる (`PATH` と同じ。
+/// 開発中の `crates/` が導入済みのものより先に来るように)。同じディレクトリの中での重複は警告する。
 pub fn discover(dirs: &[PathBuf]) -> Vec<Manifest> {
 	let mut found: Vec<Manifest> = Vec::new();
 	for dir in dirs {
+		let earlier = found.len();
 		let Ok(read) = std::fs::read_dir(dir) else { continue };
 		let mut paths: Vec<_> = read
 			.filter_map(|e| e.ok())
@@ -144,6 +166,7 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<Manifest> {
 		paths.sort();
 		for path in paths.into_iter().filter(|p| p.is_file()) {
 			match Manifest::load(&path) {
+				Ok(m) if found[..earlier].iter().any(|f| f.name == m.name) => {}
 				Ok(m) if found.iter().any(|f| f.name == m.name) => {
 					eprintln!(
 						"warning: plugin `{}` is duplicated ({}); ignored",

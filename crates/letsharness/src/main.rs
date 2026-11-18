@@ -53,17 +53,26 @@ fn run_cli() -> Result<()> {
 		})
 }
 
-/// `plugin list` / `enable` / `disable`。切り替えは profile のパッチ (`patch.toml`) に書く。
+/// `plugin list` / `enable` / `disable` / `install` / `uninstall`。切り替えは profile のパッチ (`patch.toml`) に書く。
 fn run_plugin(config: &BootConfig, cmd: &PluginCmd) -> Result<()> {
-	let plugins = Kernel::plugins(config)?;
 	let (id, enabled) = match cmd {
 		PluginCmd::List { json } => {
-			print_plugins(config, &plugins, *json)?;
+			print_plugins(config, &Kernel::plugins(config)?, *json)?;
+			return Ok(());
+		}
+		PluginCmd::Install { src, force } => return run_install(config, src, *force),
+		PluginCmd::Uninstall { name } => {
+			let dir = llm::uninstall(name, &plugins_dir()?)?;
+			println!("uninstalled {name} ({})", dir.display());
+			if let Some(p) = Kernel::plugins(config)?.into_iter().find(|p| &p.manifest.name == name) {
+				eprintln!("note: {name} は {} にもあります", p.manifest.dir.display());
+			}
 			return Ok(());
 		}
 		PluginCmd::Enable { id } => (id, true),
 		PluginCmd::Disable { id } => (id, false),
 	};
+	let plugins = Kernel::plugins(config)?;
 	if !plugins.iter().any(|p| &p.manifest.name == id) {
 		let known: Vec<&str> = plugins.iter().map(|p| p.manifest.name.as_str()).collect();
 		bail!("unknown plugin: {id} ({})", known.join("|"));
@@ -86,6 +95,35 @@ fn run_plugin(config: &BootConfig, cmd: &PluginCmd) -> Result<()> {
 	);
 	if now != enabled {
 		eprintln!("warning: --patch が profile の設定を上書きしています");
+	}
+	Ok(())
+}
+
+fn plugins_dir() -> Result<std::path::PathBuf> {
+	llm::plugins_dir().ok_or_else(|| anyhow!("プラグインの導入先がありません ($LETSHARNESS_HOME / $HOME)"))
+}
+
+/// `src` のプラグインを `<home>/plugins` に入れる。先に見つかる同名のプラグインに隠れるなら知らせる。
+fn run_install(config: &BootConfig, src: &std::path::Path, force: bool) -> Result<()> {
+	let installed = llm::install(src, &plugins_dir()?, force)?;
+	let plugins = Kernel::plugins(config)?;
+	for i in &installed {
+		let note = if i.command.is_none() {
+			" (実行ファイルは PATH から探す)"
+		} else {
+			""
+		};
+		println!("installed {} → {}{note}", i.name, i.dir.display());
+		if let Some(p) = plugins
+			.iter()
+			.find(|p| p.manifest.name == i.name && p.manifest.dir != i.dir)
+		{
+			eprintln!(
+				"warning: {} は {} のものが先に見つかるので、入れたものは使われません",
+				i.name,
+				p.manifest.dir.display()
+			);
+		}
 	}
 	Ok(())
 }
@@ -282,7 +320,7 @@ enum Cmd {
 		#[arg(long, value_name = "SESSION_ID")]
 		resume: Option<String>,
 	},
-	/// プラグインの一覧と有効/無効の切り替え (profile の patch.toml に書く。プラグインは起動しない)
+	/// プラグインの一覧・有効/無効の切り替え (profile の patch.toml に書く)・導入 (プラグインは起動しない)
 	Plugin {
 		#[command(subcommand)]
 		cmd: PluginCmd,
@@ -300,6 +338,17 @@ enum PluginCmd {
 	Enable { id: String },
 	/// profile でプラグインを無効にする
 	Disable { id: String },
+	/// プラグインを <home>/plugins/<name> に入れる (plugin.toml と実行ファイルを写す。ビルドはしない)
+	///
+	/// SRC は plugin.toml のあるディレクトリか、それが並んだディレクトリ (例: `cargo build --release` の後に `crates`)。
+	Install {
+		src: std::path::PathBuf,
+		/// 入っているものを置き換える
+		#[arg(long)]
+		force: bool,
+	},
+	/// <home>/plugins から取り除く
+	Uninstall { name: String },
 }
 
 /// `-o key=value` を `cfg` (JSON オブジェクト) にする。

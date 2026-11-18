@@ -431,6 +431,52 @@ fn mcp_server_tools_run_in_the_loop() {
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `plugin install` は plugin.toml と実行ファイルを `<home>/plugins` に写し、どこからでも発見されるようにする。
+#[test]
+fn plugins_are_installed_into_the_home() {
+	build_plugins();
+	let root = std::env::temp_dir().join(format!("lh-e2e-install-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&root);
+	let (home, empty) = (root.join("home"), root.join("empty"));
+	std::fs::create_dir_all(&empty).unwrap();
+	// 開発中の crates/ を探索先から外し、導入先だけで動かす
+	let run = |args: &[&str]| {
+		Command::new(env!("CARGO_BIN_EXE_letsharness"))
+			.args(args)
+			.env("LETSHARNESS_PLUGIN_PATH", &empty)
+			.env("LETSHARNESS_HOME", &home)
+			.env_remove("LETSHARNESS_PROFILE")
+			.env_remove("LETSHARNESS_CONFIG")
+			.current_dir(std::env::temp_dir())
+			.output()
+			.expect("run letsharness")
+	};
+	let chat = || run(&["--provider", "mock", "chat", "--model", "m", "--prompt", "hi"]);
+	assert!(!chat().status.success(), "nothing is installed yet");
+
+	let mock = plugin_dir().join("provider-mock");
+	let out = run(&["plugin", "install", mock.to_str().unwrap()]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert!(stdout(&out).contains("installed mock"), "{}", stdout(&out));
+	assert!(home.join("plugins/mock/letsharness-provider-mock").is_file());
+	assert_eq!(stdout(&chat()).trim(), "[mock] m: hi");
+
+	let out = run(&["plugin", "install", mock.to_str().unwrap()]);
+	assert!(!out.status.success());
+	assert!(stderr(&out).contains("--force"), "{}", stderr(&out));
+	assert!(
+		run(&["plugin", "install", "--force", mock.to_str().unwrap()])
+			.status
+			.success()
+	);
+
+	let out = run(&["plugin", "uninstall", "mock"]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert!(!home.join("plugins/mock").exists());
+	assert!(!chat().status.success());
+	std::fs::remove_dir_all(&root).unwrap();
+}
+
 /// 設定ファイルの `[providers.NAME]` は名前付きのインスタンスで、`default_provider` は `--provider` の既定になる。
 #[test]
 fn the_config_file_names_providers() {
