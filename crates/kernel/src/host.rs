@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 
 use crate::external::{Connection, EventSink, NoEvents, PluginEntry};
 use crate::{
-	AgentBackend, AgentOutcome, AgentRequest, ChatMessage, ChatOutput, Completion, Error, LoopOutcome, LoopRequest,
-	ModelInfo, Provider, Quota, Result, RunHandler, Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec, run_loop,
+	AgentBackend, AgentOutcome, AgentRequest, ChatMessage, ChatOutput, Completion, Error, Hook, HookPoint,
+	HookRegistry, LoopOutcome, LoopRequest, ModelInfo, ModelRequest, Provider, Quota, Result, RunHandler, Tool,
+	ToolCall, ToolDecision, ToolOutput, ToolRegistry, ToolSpec, run_loop,
 };
 
 pub struct Host {
@@ -94,9 +95,37 @@ impl Host {
 		Ok(tools)
 	}
 
-	/// `provider` のモデルと、すべてのツールでループを回す ([`run_loop`])。
+	/// Hook を提供するすべてのプラグインから Hook を集める。並びはプラグインの発見順 → manifest の記載順。
+	pub async fn hooks(&self, cfg: &Value) -> Result<HookRegistry> {
+		let mut hooks = HookRegistry::new();
+		for entry in self.entries.iter().filter(|e| !e.manifest.contributes.hook.is_empty()) {
+			let conn = entry.connection().await?;
+			for kind in &entry.manifest.contributes.hook {
+				let created = conn.call("hook.create", json!({ "kind": kind, "cfg": cfg })).await?;
+				let instance = created
+					.get("instance")
+					.and_then(Value::as_u64)
+					.ok_or_else(|| Error::plugin(entry.name, "hook.create: `instance` がありません"))?;
+				let points: Vec<HookPoint> =
+					serde_json::from_value(created.get("points").cloned().unwrap_or(Value::Null))
+						.map_err(|e| Error::plugin(entry.name, e))?;
+				hooks.add(Arc::new(RemoteHook {
+					conn: conn.clone(),
+					instance,
+					points,
+				}));
+			}
+		}
+		Ok(hooks)
+	}
+
+	pub fn hook_kinds(&self) -> Vec<&str> {
+		self.kinds(|c| &c.hook)
+	}
+
+	/// `provider` のモデルと、すべてのツール・Hook でループを回す ([`run_loop`])。
 	///
-	/// ループは kernel の責務で、モデルもツールも `Host` が引いたものをそのまま使う。
+	/// ループは kernel の責務で、モデルもツールも Hook も `Host` が引いたものをそのまま使う。
 	pub async fn run_loop(
 		&self,
 		provider: &str,
@@ -106,7 +135,8 @@ impl Host {
 	) -> Result<LoopOutcome> {
 		let provider = self.provider(provider, cfg).await?;
 		let tools = self.tools(cfg).await?;
-		run_loop(&*provider, &tools, handler, req).await
+		let hooks = self.hooks(cfg).await?;
+		run_loop(&*provider, &tools, &hooks, handler, req).await
 	}
 
 	fn kinds<'a>(&'a self, pick: impl Fn(&'a crate::external::Contributes) -> &'a Vec<String>) -> Vec<&'a str> {
@@ -403,5 +433,52 @@ impl Tool for RemoteTool {
 			// 通信の失敗もハーネスを止めず、モデルに見せる (ツールの失敗と同じ扱い)。
 			Err(e) => ToolOutput::error(e.to_string()),
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
+struct RemoteHook {
+	conn: Arc<Connection>,
+	instance: u64,
+	points: Vec<HookPoint>,
+}
+
+impl RemoteHook {
+	async fn rpc<R: DeserializeOwned>(&self, method: &str, key: &str, value: Value) -> Result<R> {
+		let v = self
+			.conn
+			.call(method, json!({ "instance": self.instance, key: value }))
+			.await?;
+		serde_json::from_value(v).map_err(|e| Error::plugin(self.conn.name(), e))
+	}
+}
+
+/// 通信の失敗も `Err` として返し、ループを止める (ツールと違い、ポリシーを素通りさせないため)。
+#[async_trait::async_trait]
+impl Hook for RemoteHook {
+	fn points(&self) -> Vec<HookPoint> {
+		self.points.clone()
+	}
+
+	async fn before_request(&self, req: ModelRequest) -> Result<ModelRequest> {
+		self.rpc("hook.before_request", "request", crate::dispatch::to_value(req)?)
+			.await
+	}
+
+	async fn on_tool_call(&self, call: ToolCall) -> Result<ToolDecision> {
+		self.rpc("hook.on_tool_call", "call", crate::dispatch::to_value(call)?)
+			.await
+	}
+
+	async fn after_response(&self, completion: Completion) -> Result<Completion> {
+		self.rpc(
+			"hook.after_response",
+			"completion",
+			crate::dispatch::to_value(completion)?,
+		)
+		.await
 	}
 }

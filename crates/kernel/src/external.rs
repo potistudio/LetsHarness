@@ -60,6 +60,9 @@ pub struct Contributes {
 	/// `Tool` の供給元の名前。
 	#[serde(default)]
 	pub tool: Vec<String>,
+	/// `Hook` の名前。ループに割り込む順は、プラグインの発見順 → ここに並べた順。
+	#[serde(default)]
+	pub hook: Vec<String>,
 }
 
 impl Manifest {

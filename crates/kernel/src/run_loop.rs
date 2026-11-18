@@ -1,7 +1,8 @@
 //! ループ本体。
 
 use crate::{
-	ChatMessage, DEFAULT_MAX_STEPS, Error, Provider, Result, RunHandler, ToolCall, ToolOutput, ToolRegistry, Usage,
+	ChatMessage, DEFAULT_MAX_STEPS, Error, HookRegistry, ModelRequest, Provider, Result, RunHandler, ToolCall,
+	ToolDecision, ToolOutput, ToolRegistry, Usage,
 };
 
 /// ループの依頼。
@@ -43,9 +44,11 @@ pub struct LoopOutcome {
 /// モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答が出るまで繰り返す。
 ///
 /// kernel の責務。モデルは [`Provider`]、ツールは [`ToolRegistry`] で、どこのプラグインのものかは知らない。
+/// `hooks` はモデル呼び出しの前後とツール実行の前に割り込み、`Err` を返せばループはそこで止まる。
 pub async fn run_loop(
 	provider: &dyn Provider,
 	tools: &ToolRegistry,
+	hooks: &HookRegistry,
 	handler: &mut dyn RunHandler,
 	req: LoopRequest,
 ) -> Result<LoopOutcome> {
@@ -62,9 +65,18 @@ pub async fn run_loop(
 	let mut usage: Option<Usage> = None;
 
 	for step in 1..=max_steps {
-		let mut turn = provider
-			.chat_with_tools(&model, messages.clone(), &specs, max_tokens)
+		let request = hooks
+			.before_request(ModelRequest {
+				model: model.clone(),
+				messages: messages.clone(),
+				tools: specs.clone(),
+				max_tokens,
+			})
 			.await?;
+		let turn = provider
+			.chat_with_tools(&request.model, request.messages, &request.tools, request.max_tokens)
+			.await?;
+		let mut turn = hooks.after_response(turn).await?;
 		if let Some(u) = turn.usage.take() {
 			merge_usage(&mut usage, u);
 		}
@@ -106,20 +118,34 @@ pub async fn run_loop(
 			turn.tool_calls.clone(),
 		));
 		for call in &turn.tool_calls {
-			let output = execute(tools, handler, call).await;
-			handler.on_tool_result(call, &output);
+			let (call, output) = execute(tools, hooks, handler, call.clone()).await?;
+			handler.on_tool_result(&call, &output);
 			messages.push(ChatMessage::tool_result(&call.id, tool_result_text(&output)));
 		}
 	}
 	unreachable!("max_steps >= 1 のためループ内で必ず return する")
 }
 
-async fn execute(tools: &ToolRegistry, handler: &mut dyn RunHandler, call: &ToolCall) -> ToolOutput {
-	handler.on_tool_call(call);
-	let Some((_, tool)) = tools.get(&call.name) else {
-		return ToolOutput::error(format!("unknown tool: {}", call.name));
+/// Hook を通してから1回のツール呼び出しを実行する。返すのは実際に扱った呼び出しと結果。
+async fn execute(
+	tools: &ToolRegistry,
+	hooks: &HookRegistry,
+	handler: &mut dyn RunHandler,
+	call: ToolCall,
+) -> Result<(ToolCall, ToolOutput)> {
+	let call = match hooks.on_tool_call(call.clone()).await? {
+		ToolDecision::Run { call } => call,
+		ToolDecision::Skip { output } => {
+			handler.on_tool_call(&call);
+			return Ok((call, output));
+		}
 	};
-	tool.call(call.arguments.clone()).await
+	handler.on_tool_call(&call);
+	let output = match tools.get(&call.name) {
+		Some((_, tool)) => tool.call(call.arguments.clone()).await,
+		None => ToolOutput::error(format!("unknown tool: {}", call.name)),
+	};
+	Ok((call, output))
 }
 
 /// モデルへ返す文字列。失敗は先頭の `Error:` で判別できるようにする
@@ -289,7 +315,9 @@ mod tests {
 			turn("done", vec![]),
 		]);
 		let mut h = Rec::default();
-		let out = run_loop(&p, &registry(&runs), &mut h, req()).await.unwrap();
+		let out = run_loop(&p, &registry(&runs), &HookRegistry::new(), &mut h, req())
+			.await
+			.unwrap();
 
 		assert_eq!(out.text, "done");
 		assert_eq!(out.steps, 2);
@@ -323,7 +351,7 @@ mod tests {
 	async fn unknown_tool_is_reported_to_model_not_fatal() {
 		let runs = Arc::new(Mutex::new(0));
 		let p = Scripted::new(vec![turn("", vec![call("c1", "nope")]), turn("ok", vec![])]);
-		let out = run_loop(&p, &registry(&runs), &mut Rec::default(), req())
+		let out = run_loop(&p, &registry(&runs), &HookRegistry::new(), &mut Rec::default(), req())
 			.await
 			.unwrap();
 		assert_eq!(out.messages[2].content, "Error: unknown tool: nope");
@@ -339,7 +367,9 @@ mod tests {
 		]);
 		let mut r = req();
 		r.max_steps = 2;
-		let out = run_loop(&p, &registry(&runs), &mut Rec::default(), r).await.unwrap();
+		let out = run_loop(&p, &registry(&runs), &HookRegistry::new(), &mut Rec::default(), r)
+			.await
+			.unwrap();
 		assert!(out.hit_step_limit);
 		assert_eq!(out.steps, 2);
 		assert_eq!(*runs.lock().unwrap(), 1, "上限ターンの要求は実行しない");
@@ -348,7 +378,90 @@ mod tests {
 
 		let mut r = req();
 		r.max_steps = 0;
-		let err = run_loop(&p, &registry(&runs), &mut Rec::default(), r).await;
+		let err = run_loop(&p, &registry(&runs), &HookRegistry::new(), &mut Rec::default(), r).await;
 		assert!(matches!(err, Err(Error::Config(_))));
+	}
+
+	/// before_request で system を足し、after_response で本文を書き換え、
+	/// on_tool_call で `deny` という名前のツールを止める Hook。
+	struct Policy;
+
+	#[async_trait::async_trait]
+	impl crate::Hook for Policy {
+		fn points(&self) -> Vec<crate::HookPoint> {
+			use crate::HookPoint::*;
+			vec![BeforeRequest, OnToolCall, AfterResponse]
+		}
+		async fn before_request(&self, mut req: ModelRequest) -> Result<ModelRequest> {
+			req.messages.insert(0, ChatMessage::system("policy"));
+			Ok(req)
+		}
+		async fn on_tool_call(&self, mut call: ToolCall) -> Result<ToolDecision> {
+			if call.name == "deny" {
+				return Ok(ToolDecision::Skip {
+					output: ToolOutput::error("denied by policy"),
+				});
+			}
+			call.arguments = serde_json::json!({"x": 2});
+			Ok(ToolDecision::Run { call })
+		}
+		async fn after_response(&self, mut c: Completion) -> Result<Completion> {
+			c.text = format!("<{}>", c.text);
+			Ok(c)
+		}
+	}
+
+	#[tokio::test]
+	async fn hooks_rewrite_requests_tool_calls_and_responses() {
+		let runs = Arc::new(Mutex::new(0));
+		let p = Scripted::new(vec![
+			turn("", vec![call("c1", "echo"), call("c2", "deny")]),
+			turn("done", vec![]),
+		]);
+		let hooks = crate::HookRegistry::new().with(Arc::new(Policy));
+		let mut h = Rec::default();
+		let out = run_loop(&p, &registry(&runs), &hooks, &mut h, req()).await.unwrap();
+
+		assert_eq!(out.text, "<done>");
+		// before_request の追加はリクエストにだけ入り、履歴には残らない
+		assert!(p.seen.lock().unwrap().iter().all(|m| m[0].content == "policy"));
+		assert_eq!(out.messages[0].role, "user");
+		// echo は書き換えた引数で実行され、deny は実行されずに結果が差し込まれる
+		assert_eq!(*runs.lock().unwrap(), 1);
+		assert_eq!(out.messages[2].content, r#"ran {"x":2}"#);
+		assert_eq!(out.messages[3].tool_call_id.as_deref(), Some("c2"));
+		assert_eq!(out.messages[3].content, "Error: denied by policy");
+		assert_eq!(
+			h.events,
+			[
+				"text:<>",
+				"call:echo",
+				"result:echo:false",
+				"call:deny",
+				"result:deny:true"
+			]
+		);
+	}
+
+	struct Fail;
+
+	#[async_trait::async_trait]
+	impl crate::Hook for Fail {
+		fn points(&self) -> Vec<crate::HookPoint> {
+			vec![crate::HookPoint::OnToolCall]
+		}
+		async fn on_tool_call(&self, _: ToolCall) -> Result<ToolDecision> {
+			Err(Error::Config("policy unavailable".into()))
+		}
+	}
+
+	#[tokio::test]
+	async fn hook_errors_stop_the_loop() {
+		let runs = Arc::new(Mutex::new(0));
+		let p = Scripted::new(vec![turn("", vec![call("c1", "echo")])]);
+		let hooks = crate::HookRegistry::new().with(Arc::new(Fail));
+		let err = run_loop(&p, &registry(&runs), &hooks, &mut Rec::default(), req()).await;
+		assert!(matches!(err, Err(Error::Config(m)) if m == "policy unavailable"));
+		assert_eq!(*runs.lock().unwrap(), 0);
 	}
 }

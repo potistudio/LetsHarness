@@ -12,6 +12,7 @@ mod agent;
 mod dispatch;
 mod external;
 mod handler;
+mod hook;
 mod host;
 mod kernel;
 mod rpc;
@@ -22,10 +23,11 @@ mod tool;
 pub use agent::{AgentBackend, AgentOutcome, AgentRequest};
 pub use external::{Contributes, MANIFEST_FILE, Manifest};
 pub use handler::{DEFAULT_MAX_STEPS, RunHandler};
+pub use hook::{Hook, HookPoint, HookRegistry, ModelRequest, ToolDecision};
 pub use host::Host;
 pub use kernel::{BootConfig, Kernel};
 pub use run_loop::{LoopOutcome, LoopRequest, run_loop};
-pub use serve::{AgentBackendFactory, BootHook, PluginServer, ProviderFactory, ToolFactory};
+pub use serve::{AgentBackendFactory, BootHook, HookFactory, PluginServer, ProviderFactory, ToolFactory};
 pub use tool::{Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
 // ---------------------------------------------------------------------------

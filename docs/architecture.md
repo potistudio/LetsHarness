@@ -16,6 +16,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | `provider-*` | 各社 API の実装。`bin` + `plugin.toml` | kernel (+ reqwest 等) |
 | `agent-*` | 外部エージェント (自分でループもツールも持つもの) を `AgentBackend` として包む。`bin` + `plugin.toml` (例: `agent-antigravity`) | kernel (+ tokio::process 等) |
 | `tool-*` | エージェントが呼ぶツール。`bin` + `plugin.toml` (例: `tool-local`) | kernel |
+| `hook-*` | ループ (`run_loop`) に割り込む Hook。`bin` + `plugin.toml` (例: `hook-guard`) | kernel |
 | `plugin-*` | 起動時フックなど。`bin` + `plugin.toml` (例: `plugin-dotenv`) | kernel |
 
 プラグイン同士・Client からプラグインへの Cargo 依存は存在しない。つながるのは実行時の発見と JSON だけ。
@@ -24,7 +25,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 ## Principles
 
 1. **Client は kernel を動かすだけ。** プラグインの列挙もリンクもしない。`Kernel::boot(BootConfig)` が実行時にプラグインを発見し、Client は返ってきた `Host` を使う。kernel 単体でもプラグイン0個で起動する。
-2. **拡張点は kernel が決め打ちしない。** プラグインは manifest の `contributes` に文字列 ID (`provider` / `agent` / `tool` / `boot`) で宣言し、kernel はそれを `dyn Provider` / `dyn AgentBackend` / `dyn Tool` として見せる Adapter を持つ。新しい拡張点は新しい `contributes` キーとメッセージで足す。
+2. **拡張点は kernel が決め打ちしない。** プラグインは manifest の `contributes` に文字列 ID (`provider` / `agent` / `tool` / `hook` / `boot`) で宣言し、kernel はそれを `dyn Provider` / `dyn AgentBackend` / `dyn Tool` / `dyn Hook` として見せる Adapter を持つ。新しい拡張点は新しい `contributes` キーとメッセージで足す。
 3. **プラグインを使うのは kernel。** Client も広義のプラグインと同じ立場で、`Host` 経由でしかプラグインに触れない。プラグイン同士も互いを知らない。起動前の処理 (`.env` など) は `boot` で環境変数を返す形にし、kernel 自身の環境は書き換えない。
 4. **Client は Provider を直接呼ばない。** 必ず `Host` (将来は `Session`) を経由し、hook と tool がどの Client からでも同じように効くようにする。
 5. **モデルとエージェントを分ける。** 分ける軸は認証方式 (APIキー / CLI のログイン) ではなく「エージェントループを誰が回すか」。1回の呼び出しがモデル1回で、ツール・履歴をこちらが持つものは `Provider`。ループ・ツール・会話履歴を相手が持つもの (Antigravity CLI など) は `AgentBackend`。CLI の保存済み認証情報で API を直接叩くなら、それは `Provider`。
@@ -41,7 +42,23 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | `provider` | `ProviderFactory` → `Provider` | `Host::provider(kind, cfg)` → `Arc<dyn Provider>` | LLM API。`create(cfg: Value)` でインスタンス化 |
 | `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | ループもツールも自分で持って最終回答まで自走する外部エージェント。途中経過はプロセス間で通知として流れる |
 | `tool` | `ToolFactory` → `Tool` | `Host::tools(cfg)` → `ToolRegistry` | エージェントが呼ぶツール。スキーマは MCP と同形 |
+| `hook` | `HookFactory` → `Hook` | `Host::hooks(cfg)` → `HookRegistry` | ループに割り込む。モデル呼び出しの前後とツール実行の前に、リクエスト・ツール呼び出し・応答を書き換えたり止めたりする |
 | `boot` | `BootHook` | (Kernel が起動時に呼ぶ) | 返した環境変数が、以降に起動するプラグインの環境に足される |
+
+### Hook
+
+ループ自体は変えずに振る舞いを足すための口。DeepSeek Harness (Cordis) の waterfall / bail イベントに当たる。
+
+| 箇所 (`HookPoint`) | 受け取るもの → 返すもの | 効き方 |
+| --- | --- | --- |
+| `before_request` | `ModelRequest` → `ModelRequest` | その1回のリクエストだけに効く。ループの履歴 (`LoopOutcome::messages`) には残らない |
+| `after_response` | `Completion` → `Completion` | 書き換えた応答が履歴に残り、ツール呼び出しもそれに従う |
+| `on_tool_call` | `ToolCall` → `ToolDecision` | `Run { call }` で (書き換えて) 実行、`Skip { output }` で実行せず結果を差し込む。`call.id` は書き換えても元に戻る |
+
+- 複数の Hook は直列につながり、前の出力が次の入力になる。順はプラグインの発見順 → manifest の `contributes.hook` の記載順。`on_tool_call` は最初の `Skip` で止まる。
+- Hook は `points()` で割り込む箇所を宣言し、挙げた箇所だけが呼ばれる (割り込まない Hook のためにプロセス間で履歴を往復させない)。設定次第で何もしないなら空を返す。
+- Hook が `Err` を返すと (通信の失敗も含めて) ループはそこで止まる。ツールの失敗と違ってモデルには見せない。ポリシーを黙って素通りさせないため。
+- `cfg` はツールと同じくループに渡る設定 (`-o key=value` と `workdir`)。例: `hook-guard` は `-o deny_tools=bash,write_file` のツールを `Skip` する。
 
 ## Provider / Loop / Agent
 
@@ -105,7 +122,7 @@ path = "~/.letsharness/plugins/openai-compat"
   - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。向きは kernel → プラグインのみ。
   - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。
   - 型の後方互換は保証しない。プラグインと kernel は同じバージョンでビルドする。
-  - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call`。
+  - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call` / `hook.create` / `hook.before_request` / `hook.on_tool_call` / `hook.after_response`。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
 - Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。
@@ -114,7 +131,7 @@ path = "~/.letsharness/plugins/openai-compat"
 
 1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。設定ファイル (`default_provider` / `[providers.x]`) を導入する。いまの `Provider` は多数のメソッドを持ち、そのまま線の上を流れている。
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
-3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response) を効かせる。
+3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` (Client が直接 `chat` するときにも Hook を効かせる) は未着手。
 4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) は実装済み。
 5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
@@ -146,6 +163,7 @@ classDiagram
     +provider(kind, cfg) Arc~dyn Provider~
     +agent_backend(kind, cfg) Arc~dyn AgentBackend~
     +tools(cfg) ToolRegistry
+    +hooks(cfg) HookRegistry
     +run_loop(provider, cfg, req, handler) LoopOutcome
     +has_agent_backend(kind) bool
   }
@@ -166,6 +184,7 @@ classDiagram
   class RemoteProvider
   class RemoteAgent
   class RemoteTool
+  class RemoteHook
 
   class Provider {
     <<interface>>
@@ -176,12 +195,16 @@ classDiagram
   class Tool {
     <<interface>>
   }
+  class Hook {
+    <<interface>>
+  }
 
   %% ---- プラグイン側 (別プロセス) ----
   class PluginServer {
     +provider(ProviderFactory)
     +agent(AgentBackendFactory)
     +tool(ToolFactory)
+    +hook(HookFactory)
     +boot_hook(BootHook)
     +serve()
   }
@@ -200,6 +223,11 @@ classDiagram
     +name() str
     +create(cfg) Vec~Tool~
   }
+  class HookFactory {
+    <<interface>>
+    +name() str
+    +create(cfg) Hook
+  }
   class BootHook {
     <<interface>>
     +boot(options) env
@@ -212,6 +240,7 @@ classDiagram
   class AgentAntigravity
   class ToolLocal
   class PluginDotenv
+  class HookGuard
 
   Client ..> Kernel : boot
   Client ..> Host : 頼む
@@ -226,28 +255,33 @@ classDiagram
   Provider <|.. RemoteProvider
   AgentBackend <|.. RemoteAgent
   Tool <|.. RemoteTool
+  Hook <|.. RemoteHook
   Host ..> RemoteProvider : create
   Host ..> RemoteAgent : create
   Host ..> RemoteTool : create
+  Host ..> RemoteHook : create
   RemoteProvider ..> Connection
   RemoteAgent ..> Connection
   RemoteTool ..> Connection
+  RemoteHook ..> Connection
 
   PluginServer o-- ProviderFactory
   PluginServer o-- AgentBackendFactory
   PluginServer o-- ToolFactory
+  PluginServer o-- HookFactory
   PluginServer o-- BootHook
   ProviderFactory <|.. ProviderCommandCode
   ProviderFactory <|.. ProviderGemini
   ProviderFactory <|.. ProviderMock
   AgentBackendFactory <|.. AgentAntigravity
   ToolFactory <|.. ToolLocal
+  HookFactory <|.. HookGuard
   BootHook <|.. PluginDotenv
 
   note for Client "kernel にしか依存しない\nプラグインの列挙もリンクもしない"
   note for Kernel "プラグイン0個でも起動する\nboot で環境変数を集め、以降のプラグインの環境に足す\n(自分の環境変数は書き換えない)"
   note for Connection "プラグインはクラッシュしても kernel を巻き込まない\nストリーム/エージェントの途中経過は params.req 付きの通知"
-  note for Manifest "contributes: provider / agent / tool / boot\n使われたときに初めて起動"
+  note for Manifest "contributes: provider / agent / tool / hook / boot\n使われたときに初めて起動"
 ```
 
 ### Provider

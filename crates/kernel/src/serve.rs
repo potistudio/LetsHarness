@@ -19,7 +19,10 @@ use tokio::sync::mpsc;
 
 use crate::dispatch::{call_provider, field, to_value};
 use crate::rpc::{Frame, WireError};
-use crate::{AgentBackend, AgentRequest, Error, Provider, Result, RunHandler, Tool, ToolCall, ToolOutput};
+use crate::{
+	AgentBackend, AgentRequest, Completion, Error, Hook, ModelRequest, Provider, Result, RunHandler, Tool, ToolCall,
+	ToolOutput,
+};
 
 // ---------------------------------------------------------------------------
 // プラグインが実装する拡張点
@@ -57,6 +60,15 @@ pub trait ToolFactory: Send + Sync {
 	fn create(&self, cfg: &Value) -> Result<Vec<Arc<dyn Tool>>>;
 }
 
+/// ループに割り込む [`Hook`] の供給元。
+pub trait HookFactory: Send + Sync {
+	/// manifest の `contributes.hook` と一致させる。
+	fn name(&self) -> &'static str;
+
+	/// `cfg` はループに渡る設定 (`-o key=value` と `workdir`)。割り込まないなら `points()` が空の Hook を返す。
+	fn create(&self, cfg: &Value) -> Result<Arc<dyn Hook>>;
+}
+
 /// 起動時に呼ばれ、以降に起動するプラグインへ渡す環境変数を返す。
 pub trait BootHook: Send + Sync {
 	/// `options` は `-o key=value` を集めた JSON オブジェクト。
@@ -73,6 +85,7 @@ pub struct PluginServer {
 	providers: Vec<Arc<dyn ProviderFactory>>,
 	agents: Vec<Arc<dyn AgentBackendFactory>>,
 	tools: Vec<Arc<dyn ToolFactory>>,
+	hooks: Vec<Arc<dyn HookFactory>>,
 }
 
 impl PluginServer {
@@ -100,6 +113,11 @@ impl PluginServer {
 		self
 	}
 
+	pub fn hook(mut self, factory: impl HookFactory + 'static) -> Self {
+		self.hooks.push(Arc::new(factory));
+		self
+	}
+
 	/// stdin が閉じるまで Kernel からの呼び出しに答える。
 	pub async fn serve(self) {
 		let (out, mut out_rx) = mpsc::unbounded_channel::<Frame>();
@@ -110,6 +128,7 @@ impl PluginServer {
 			providers: Mutex::new(HashMap::new()),
 			agents: Mutex::new(HashMap::new()),
 			tools: Mutex::new(HashMap::new()),
+			hooks: Mutex::new(HashMap::new()),
 		});
 
 		let writer = tokio::spawn(async move {
@@ -155,6 +174,7 @@ struct Inner {
 	providers: Mutex<HashMap<u64, Arc<dyn Provider>>>,
 	agents: Mutex<HashMap<u64, Arc<dyn AgentBackend>>>,
 	tools: Mutex<HashMap<u64, Arc<dyn Tool>>>,
+	hooks: Mutex<HashMap<u64, Arc<dyn Hook>>>,
 }
 
 impl Inner {
@@ -263,6 +283,39 @@ impl Inner {
 					.cloned()
 					.ok_or_else(|| Error::Config(format!("unknown tool: {id}")))?;
 				to_value(tool.call(params.get("args").cloned().unwrap_or(Value::Null)).await)
+			}
+			"hook.create" => {
+				let kind: String = field(&params, "kind")?;
+				let factory = self
+					.server
+					.hooks
+					.iter()
+					.find(|f| f.name() == kind)
+					.ok_or_else(|| Error::Config(format!("unknown hook: {kind}")))?;
+				let hook = factory.create(params.get("cfg").unwrap_or(&Value::Null))?;
+				let (id, points) = (self.instance_id(), hook.points());
+				self.hooks.lock().unwrap().insert(id, hook);
+				Ok(json!({ "instance": id, "points": points }))
+			}
+			m if m.starts_with("hook.") => {
+				let instance: u64 = field(&params, "instance")?;
+				let hook = self
+					.hooks
+					.lock()
+					.unwrap()
+					.get(&instance)
+					.cloned()
+					.ok_or_else(|| Error::Config(format!("unknown hook instance: {instance}")))?;
+				match &m["hook.".len()..] {
+					"before_request" => {
+						to_value(hook.before_request(field::<ModelRequest>(&params, "request")?).await?)
+					}
+					"on_tool_call" => to_value(hook.on_tool_call(field::<ToolCall>(&params, "call")?).await?),
+					"after_response" => {
+						to_value(hook.after_response(field::<Completion>(&params, "completion")?).await?)
+					}
+					other => Err(Error::Unsupported(format!("hook.{other}"))),
+				}
 			}
 			other => Err(Error::Unsupported(other.to_owned())),
 		}

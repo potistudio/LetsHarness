@@ -1,0 +1,5 @@
+name = "guard"
+command = "letsharness-hook-guard"
+
+[contributes]
+hook = ["guard"]

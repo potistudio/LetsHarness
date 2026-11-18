@@ -12,6 +12,7 @@ const PLUGINS: &[&str] = &[
 	"letsharness-tool-local",
 	"letsharness-plugin-dotenv",
 	"letsharness-agent-antigravity",
+	"letsharness-hook-guard",
 ];
 
 fn plugin_dir() -> PathBuf {
@@ -145,6 +146,34 @@ fn kernel_loop_runs_external_provider_and_external_tools() {
 	]);
 	assert!(out.status.success(), "{}", stderr(&out));
 	assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "from tool");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 外部プラグインの Hook がループに割り込み、ツールを実行させずに結果を差し込む。
+#[test]
+fn hook_plugin_blocks_a_tool_call() {
+	let dir = std::env::temp_dir().join(format!("lh-e2e-hook-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let out = letsharness(&[
+		"--provider",
+		"mock",
+		"-o",
+		"deny_tools=write_file",
+		"loop",
+		"--model",
+		"m",
+		"--prompt",
+		r#"tool:write_file {"path":"a.txt","content":"from tool"}"#,
+		"--workdir",
+		dir.to_str().unwrap(),
+	]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert!(!dir.join("a.txt").exists(), "blocked tool must not run");
+	assert!(
+		stdout(&out).contains("tool `write_file` is blocked by deny_tools"),
+		"{}",
+		stdout(&out)
+	);
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
