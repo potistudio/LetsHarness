@@ -110,12 +110,36 @@ async fn main() {
 }
 ```
 
-発見先 (`BootConfig::plugin_path`) は `$LETSHARNESS_PLUGIN_PATH` → 実行ファイル横の `plugins/` → `~/.letsharness/plugins`。各ディレクトリの直下 `*/plugin.toml` を読む。
+発見先 (`BootConfig::plugin_path`) は `$LETSHARNESS_PLUGIN_PATH` → 実行ファイル横の `plugins/` → `~/.letsharness/plugins`。各ディレクトリの直下 `*/plugin.toml` を読む。そのうえで [パッチ層](#profile-とパッチ層) を重ねる。
 開発中は `.cargo/config.toml` が `LETSHARNESS_PLUGIN_PATH=crates` を設定するので、`cargo build --workspace` したあと `cargo run -p letsharness -- ...` でそのまま動く。
 
 ## Configuration
 
 優先順位は `デフォルト < 設定ファイル < 環境変数 < CLI (-o key=value)`。
+
+### Profile とパッチ層
+
+どのプラグインを使い、どの順に並べ、どんな設定を渡すかは、層を重ねて決める。DeepSeek Harness の profile / bundle / `cordis.patch.yml` に当たる。
+
+1. 発見したプラグイン (すべて有効・発見順)
+2. profile のパッチ `<home>/profiles/<profile>/patch.toml` (無ければ空)。`<home>` は `$LETSHARNESS_HOME` → `~/.letsharness`、profile は `--profile` → `$LETSHARNESS_PROFILE` → `default`
+3. `--patch FILE` (指定順。ファイルが無ければ起動を止める)
+
+```toml
+[[plugins]]
+id = "guard"                        # manifest の name
+order = -10                         # 小さいほど先 (既定 0、同じなら発見順)。Hook の割り込む順にも効く
+config = { deny_tools = "bash" }    # このプラグインに渡す設定。前の層の config を丸ごと置き換える
+
+[[plugins]]
+path = "~/src/my-plugin"            # 発見されていないプラグインを足す。相対パスはこのファイルから
+disabled = true
+```
+
+- 行は書いたフィールドだけが前の層を上書きする。プラグインに渡る `cfg` は `config` に `-o key=value` (と `workdir`) を上書きしたもの。
+- 知らない `id`・名前の重複・未知のフィールドは、ファイルと行を添えて起動を止める。黙って無視しない。
+- `letsharness plugin list` で層を重ねた結果を、`plugin enable <id>` / `plugin disable <id>` で profile のパッチを書き換える (プラグインは起動しない)。既定 (有効) に戻すと行は消え、profile には既定との差分だけが残る。書き戻すときコメントは残らない。
+- GUI は `$LETSHARNESS_PROFILE` の profile を使う。
 
 `.env` は `crates/plugin-dotenv` が `boot` で読み、未設定の環境変数だけを返す（`.env < 環境変数`）。kernel はそれを以降に起動するプラグインの環境に足す。カレントから親へ遡って探し、`-o env_file=<PATH>` で指定、`-o no_env_file=true` で無効化できる。
 
@@ -158,7 +182,7 @@ path = "~/.letsharness/plugins/openai-compat"
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
 3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` も実装済みで、`chat` / GUI にも Hook と Observer が効く。会話の履歴を `Session` に持たせるのは未着手。
 4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) は実装済み。
-5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。
+5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。profile とパッチ層 (有効/無効・並び順・プラグインごとの設定・`path` での追加) と `letsharness plugin list/enable/disable` は実装済み。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
 
 ## Diagrams
@@ -179,10 +203,13 @@ classDiagram
   %% ---- kernel ----
   class Kernel {
     +boot(BootConfig) Host
+    +plugins(BootConfig) Vec~PluginState~
   }
   class BootConfig {
     +options: Vec~(String, String)~
     +plugin_path: Vec~PathBuf~
+    +profile: Option~String~
+    +patches: Vec~PathBuf~
   }
   class Host {
     +session(kind, cfg) Session
@@ -286,7 +313,7 @@ classDiagram
   Client ..> Session : モデルを使う
   Host ..> Session : 作る
   Kernel ..> BootConfig
-  Kernel ..> Manifest : 発見 (*/plugin.toml)
+  Kernel ..> Manifest : 発見 (*/plugin.toml) + パッチ層
   Kernel --> Host : 返す
   Host o-- PluginEntry
   PluginEntry *-- Manifest

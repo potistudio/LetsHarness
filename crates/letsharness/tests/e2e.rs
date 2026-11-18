@@ -33,11 +33,23 @@ fn build_plugins() {
 	});
 }
 
+/// 何も書かれていない LetsHarness の置き場 (利用者の `~/.letsharness` の profile を読まないため)。
+fn empty_home() -> PathBuf {
+	std::env::temp_dir().join(format!("lh-e2e-home-{}-empty", std::process::id()))
+}
+
 fn letsharness(args: &[&str]) -> Output {
+	letsharness_in(&empty_home(), args)
+}
+
+/// `home` を `$LETSHARNESS_HOME` にして動かす (profile を読み書きするテスト用)。
+fn letsharness_in(home: &std::path::Path, args: &[&str]) -> Output {
 	build_plugins();
 	Command::new(env!("CARGO_BIN_EXE_letsharness"))
 		.args(args)
 		.env("LETSHARNESS_PLUGIN_PATH", plugin_dir())
+		.env("LETSHARNESS_HOME", home)
+		.env_remove("LETSHARNESS_PROFILE")
 		.current_dir(std::env::temp_dir())
 		.output()
 		.expect("run letsharness")
@@ -124,6 +136,7 @@ fn kernel_runs_without_any_plugin() {
 	let out = Command::new(env!("CARGO_BIN_EXE_letsharness"))
 		.args(["--provider", "mock", "models"])
 		.env("LETSHARNESS_PLUGIN_PATH", "/nonexistent")
+		.env("LETSHARNESS_HOME", empty_home())
 		.output()
 		.unwrap();
 	assert!(!out.status.success());
@@ -271,6 +284,85 @@ fn chat_goes_through_the_session() {
 	std::fs::remove_file(&log).unwrap();
 }
 
+/// `plugin disable` は profile に書かれ、以降の起動でそのプラグインは使われない。`enable` で跡が消える。
+#[test]
+fn plugins_are_toggled_in_the_profile() {
+	let home = std::env::temp_dir().join(format!("lh-e2e-profile-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&home);
+	let patch = home.join("profiles/default/patch.toml");
+
+	let out = letsharness_in(&home, &["plugin", "disable", "guard"]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert!(stdout(&out).starts_with("guard: disabled"), "{}", stdout(&out));
+	let list = stdout(&letsharness_in(&home, &["plugin", "list"]));
+	assert!(list.contains("off guard [hook:guard]"), "{list}");
+
+	// 無効な guard は deny_tools を見ないので、ツールが実行される
+	let dir = home.join("work");
+	std::fs::create_dir_all(&dir).unwrap();
+	let out = letsharness_in(
+		&home,
+		&[
+			"--provider",
+			"mock",
+			"-o",
+			"deny_tools=write_file",
+			"loop",
+			"--model",
+			"m",
+			"--prompt",
+			r#"tool:write_file {"path":"a.txt","content":"x"}"#,
+			"--workdir",
+			dir.to_str().unwrap(),
+		],
+	);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert!(dir.join("a.txt").exists());
+
+	let out = letsharness_in(&home, &["plugin", "enable", "guard"]);
+	assert!(stdout(&out).starts_with("guard: enabled"), "{}", stdout(&out));
+	assert_eq!(std::fs::read_to_string(&patch).unwrap().trim(), "");
+
+	let out = letsharness_in(&home, &["plugin", "disable", "nope"]);
+	assert!(!out.status.success());
+	assert!(stderr(&out).contains("unknown plugin: nope"), "{}", stderr(&out));
+	std::fs::remove_dir_all(&home).unwrap();
+}
+
+/// パッチの `config` がプラグインに届き、`-o` がそれより強い。知らない id は起動を止める。
+#[test]
+fn patch_layers_configure_plugins() {
+	let dir = std::env::temp_dir().join(format!("lh-e2e-patch-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let patch = dir.join("mock.toml");
+	std::fs::write(&patch, "[[plugins]]\nid = \"mock\"\nconfig = { prefix = \"P> \" }\n").unwrap();
+	let patch = patch.to_str().unwrap();
+
+	let chat = [
+		"--provider",
+		"mock",
+		"--patch",
+		patch,
+		"chat",
+		"--model",
+		"m",
+		"--prompt",
+		"hi",
+	];
+	let out = letsharness(&chat);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert_eq!(stdout(&out).trim(), "P> m: hi");
+	let out = letsharness(&[&["-o", "prefix=>> "][..], &chat].concat());
+	assert_eq!(stdout(&out).trim(), ">> m: hi");
+
+	let bad = dir.join("bad.toml");
+	std::fs::write(&bad, "[[plugins]]\nid = \"nope\"\n").unwrap();
+	let out = letsharness(&["--patch", bad.to_str().unwrap(), "--provider", "mock", "models"]);
+	assert!(!out.status.success());
+	assert!(stderr(&out).contains("unknown plugin `nope`"), "{}", stderr(&out));
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn dotenv_boot_options_are_validated() {
 	let out = letsharness(&[
@@ -314,6 +406,7 @@ EOF
 		.arg(&dir)
 		.env("LETSHARNESS_PLUGIN_PATH", plugin_dir())
 		.env("AGY_BIN", &agy)
+		.env("LETSHARNESS_HOME", empty_home())
 		.output()
 		.unwrap();
 	let (so, se) = (stdout(&out), stderr(&out));

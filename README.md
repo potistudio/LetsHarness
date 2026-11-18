@@ -48,6 +48,15 @@ Pick the provider and model from the composer. `-o KEY=VALUE` is passed to the k
 (e.g. `cargo run -p letsharness-gui -- -o env_file=.env`).
 
 In this repository `.cargo/config.toml` points `LETSHARNESS_PLUGIN_PATH` at `crates/`, so each `crates/*/plugin.toml` is found as is.
+
+Plugins are all enabled by default. List them, or turn one off for the current profile (`~/.letsharness/profiles/default/patch.toml`):
+
+```bash
+cargo run --release -- plugin list
+cargo run --release -- plugin disable guard
+```
+
+`--profile NAME` picks another profile, and `--patch FILE` layers more changes (enable/disable, order, per-plugin config) on top.
 See [docs/architecture.md](docs/architecture.md) for how plugins are discovered and written.
 
 ## License

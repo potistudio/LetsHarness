@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
@@ -66,6 +66,26 @@ pub struct Contributes {
 	/// `Observer` の名前。
 	#[serde(default)]
 	pub observer: Vec<String>,
+}
+
+impl Contributes {
+	/// 表示用の一覧 (例: `provider:mock`, `hook:guard`, `boot`)。
+	pub fn summary(&self) -> Vec<String> {
+		let mut out = Vec::new();
+		for (what, names) in [
+			("provider", &self.provider),
+			("agent", &self.agent),
+			("tool", &self.tool),
+			("hook", &self.hook),
+			("observer", &self.observer),
+		] {
+			out.extend(names.iter().map(|n| format!("{what}:{n}")));
+		}
+		if self.boot {
+			out.push("boot".into());
+		}
+		out
+	}
 }
 
 impl Manifest {
@@ -380,6 +400,8 @@ impl Drop for Call {
 
 pub struct PluginEntry {
 	pub manifest: Manifest,
+	/// パッチ層で決まったこのプラグインの設定。
+	config: Map<String, Value>,
 	/// エラー表示用 (`Error::Plugin` が `&'static str` を要求するため、起動時に1度だけ確保する)。
 	pub name: &'static str,
 	env: Arc<HashMap<String, String>>,
@@ -387,14 +409,24 @@ pub struct PluginEntry {
 }
 
 impl PluginEntry {
-	pub fn new(manifest: Manifest, env: Arc<HashMap<String, String>>) -> Self {
+	pub fn new(manifest: Manifest, config: Map<String, Value>, env: Arc<HashMap<String, String>>) -> Self {
 		let name: &'static str = Box::leak(manifest.name.clone().into_boxed_str());
 		Self {
 			manifest,
+			config,
 			name,
 			env,
 			conn: OnceCell::new(),
 		}
+	}
+
+	/// このプラグインに渡す設定: パッチ層の `config` に `cfg` (`-o key=value` など) を上書きしたもの。
+	pub fn cfg(&self, cfg: &Value) -> Value {
+		let mut merged = self.config.clone();
+		if let Value::Object(cfg) = cfg {
+			merged.extend(cfg.iter().map(|(k, v)| (k.clone(), v.clone())));
+		}
+		Value::Object(merged)
 	}
 
 	/// 初回に起動して、以降は同じプロセスを使う。

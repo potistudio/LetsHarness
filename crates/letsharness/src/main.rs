@@ -26,14 +26,106 @@ fn main() -> ExitCode {
 
 fn run_cli() -> Result<()> {
 	let cli = Cli::parse();
+	// `-o` はそのまま Kernel に渡す。`boot` を持つプラグインとプロバイダが必要なものを拾う。
+	let mut config = BootConfig::new(cli.options.clone());
+	if let Some(profile) = &cli.profile {
+		config.profile = Some(profile.clone());
+	}
+	config.patches = cli.patch.clone();
+	// プラグインの管理はプラグインを起動しない。
+	if let Cmd::Plugin { cmd } = &cli.cmd {
+		return run_plugin(&config, cmd);
+	}
 	tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()?
 		.block_on(async {
-			// `-o` はそのまま Kernel に渡す。`boot` を持つプラグインとプロバイダが必要なものを拾う。
-			let host = Kernel::boot(BootConfig::new(cli.options.clone())).await?;
+			let host = Kernel::boot(config).await?;
 			run(&host, cli).await
 		})
+}
+
+/// `plugin list` / `enable` / `disable`。切り替えは profile のパッチ (`patch.toml`) に書く。
+fn run_plugin(config: &BootConfig, cmd: &PluginCmd) -> Result<()> {
+	let plugins = Kernel::plugins(config)?;
+	let (id, enabled) = match cmd {
+		PluginCmd::List { json } => {
+			print_plugins(config, &plugins, *json)?;
+			return Ok(());
+		}
+		PluginCmd::Enable { id } => (id, true),
+		PluginCmd::Disable { id } => (id, false),
+	};
+	if !plugins.iter().any(|p| &p.manifest.name == id) {
+		let known: Vec<&str> = plugins.iter().map(|p| p.manifest.name.as_str()).collect();
+		bail!("unknown plugin: {id} ({})", known.join("|"));
+	}
+	let Some(path) = config.profile_patch()? else {
+		bail!("profile がありません (--profile を指定してください)");
+	};
+	let mut patch = llm::Patch::load_or_default(&path)?;
+	patch.set_enabled(&path, id, enabled)?;
+	patch.save(&path)?;
+
+	let now = Kernel::plugins(config)?
+		.into_iter()
+		.find(|p| &p.manifest.name == id)
+		.is_some_and(|p| p.enabled);
+	println!(
+		"{id}: {} ({})",
+		if now { "enabled" } else { "disabled" },
+		path.display()
+	);
+	if now != enabled {
+		eprintln!("warning: --patch が profile の設定を上書きしています");
+	}
+	Ok(())
+}
+
+fn print_plugins(config: &BootConfig, plugins: &[llm::PluginState], json: bool) -> Result<()> {
+	if json {
+		let out: Vec<Value> = plugins
+			.iter()
+			.map(|p| {
+				json!({
+					"name": p.manifest.name,
+					"enabled": p.enabled,
+					"order": p.order,
+					"contributes": p.manifest.contributes.summary(),
+					"config": p.config,
+					"dir": p.manifest.dir,
+				})
+			})
+			.collect();
+		println!("{}", serde_json::to_string_pretty(&out)?);
+		return Ok(());
+	}
+	if let Some(path) = config.profile_patch()? {
+		let profile = config.profile.as_deref().unwrap_or_default();
+		println!("profile: {profile} ({})", path.display());
+	}
+	for patch in &config.patches {
+		println!("patch: {}", patch.display());
+	}
+	for p in plugins {
+		let mark = if p.enabled { "on " } else { "off" };
+		let order = if p.order == 0 {
+			String::new()
+		} else {
+			format!(" order={}", p.order)
+		};
+		let config = if p.config.is_empty() {
+			String::new()
+		} else {
+			format!(" config={}", Value::Object(p.config.clone()))
+		};
+		println!(
+			"{mark} {} [{}]{order}{config}",
+			p.manifest.name,
+			p.manifest.contributes.summary().join(", ")
+		);
+	}
+	Ok(())
 }
 
 /// `-o key=value`。
@@ -55,8 +147,16 @@ struct Cli {
 	#[arg(long, global = true)]
 	backend: Option<String>,
 	/// プラグイン固有の設定 (例: `-o prefix=">> "` / `-o error=boom` は mock、`-o env_file=PATH` / `-o no_env_file=true` は dotenv)
+	///
+	/// パッチ層の `config` より強い。
 	#[arg(short = 'o', long = "option", global = true, value_name = "KEY=VALUE", value_parser = parse_option)]
 	options: Vec<(String, String)>,
+	/// 使う profile (既定は $LETSHARNESS_PROFILE、無ければ default)。<home>/profiles/<NAME>/patch.toml を最初の層にする
+	#[arg(long, global = true, value_name = "NAME")]
+	profile: Option<String>,
+	/// profile の後に重ねるパッチ (指定順。プラグインの有効/無効・並び順・設定を変える)
+	#[arg(long, global = true, value_name = "FILE")]
+	patch: Vec<std::path::PathBuf>,
 
 	#[command(subcommand)]
 	cmd: Cmd,
@@ -162,6 +262,24 @@ enum Cmd {
 		#[arg(long, value_name = "SESSION_ID")]
 		resume: Option<String>,
 	},
+	/// プラグインの一覧と有効/無効の切り替え (profile の patch.toml に書く。プラグインは起動しない)
+	Plugin {
+		#[command(subcommand)]
+		cmd: PluginCmd,
+	},
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+	/// 層を重ねた結果のプラグイン (並び順。無効なものも含む)
+	List {
+		#[arg(long)]
+		json: bool,
+	},
+	/// profile でプラグインを有効にする
+	Enable { id: String },
+	/// profile でプラグインを無効にする
+	Disable { id: String },
 }
 
 /// `-o key=value` を `cfg` (JSON オブジェクト) にする。
@@ -310,6 +428,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			)
 			.await?;
 		}
+		Cmd::Plugin { .. } => unreachable!("run_cli がプラグインを起動せずに処理する"),
 		Cmd::Agent {
 			model,
 			prompt,

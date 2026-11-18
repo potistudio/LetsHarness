@@ -16,6 +16,7 @@ mod hook;
 mod host;
 mod kernel;
 mod observe;
+mod profile;
 mod rpc;
 mod run_loop;
 mod serve;
@@ -29,6 +30,9 @@ pub use hook::{Hook, HookPoint, HookRegistry, ModelRequest, ToolDecision};
 pub use host::Host;
 pub use kernel::{BootConfig, Kernel};
 pub use observe::{Event, Observer};
+pub use profile::{
+	DEFAULT_PROFILE, Layer, PATCH_FILE, Patch, PatchRow, PluginState, compose, home_dir, profile_patch_path,
+};
 pub use run_loop::{LoopOutcome, LoopRequest, run_loop};
 pub use serve::{
 	AgentBackendFactory, BootHook, HookFactory, ObserverFactory, PluginServer, ProviderFactory, ToolFactory,

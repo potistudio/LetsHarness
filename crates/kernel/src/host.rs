@@ -54,7 +54,7 @@ impl Host {
 			.ok_or_else(|| unknown("provider", kind, self.provider_kinds()))?;
 		let conn = entry.connection().await?;
 		let created = conn
-			.call("provider.create", json!({ "kind": kind, "cfg": cfg }))
+			.call("provider.create", json!({ "kind": kind, "cfg": entry.cfg(cfg) }))
 			.await?;
 		let (instance, name) = created_instance(entry.name, &created)?;
 		Ok(Arc::new(RemoteProvider { conn, instance, name }))
@@ -72,7 +72,9 @@ impl Host {
 			.find(|e| e.manifest.contributes.agent.iter().any(|k| k == kind))
 			.ok_or_else(|| unknown("backend", kind, self.agent_backend_kinds()))?;
 		let conn = entry.connection().await?;
-		let created = conn.call("agent.create", json!({ "kind": kind, "cfg": cfg })).await?;
+		let created = conn
+			.call("agent.create", json!({ "kind": kind, "cfg": entry.cfg(cfg) }))
+			.await?;
 		let (instance, name) = created_instance(entry.name, &created)?;
 		Ok(Arc::new(RemoteAgent { conn, instance, name }))
 	}
@@ -93,7 +95,9 @@ impl Host {
 		for entry in self.entries.iter().filter(|e| !e.manifest.contributes.tool.is_empty()) {
 			let conn = entry.connection().await?;
 			for kind in &entry.manifest.contributes.tool {
-				let created = conn.call("tool.create", json!({ "kind": kind, "cfg": cfg })).await?;
+				let created = conn
+					.call("tool.create", json!({ "kind": kind, "cfg": entry.cfg(cfg) }))
+					.await?;
 				let list = created.get("tools").cloned().unwrap_or(Value::Null);
 				let list: Vec<RemoteToolInfo> =
 					serde_json::from_value(list).map_err(|e| Error::plugin(entry.name, e))?;
@@ -118,7 +122,10 @@ impl Host {
 			let conn = entry.connection().await?;
 			for kind in &entry.manifest.contributes.hook {
 				let created = conn
-					.call("hook.create", json!({ "kind": kind, "cfg": cfg, "tools": tools }))
+					.call(
+						"hook.create",
+						json!({ "kind": kind, "cfg": entry.cfg(cfg), "tools": tools }),
+					)
 					.await?;
 				let instance = created
 					.get("instance")
@@ -152,7 +159,7 @@ impl Host {
 			let conn = entry.connection().await?;
 			for kind in &entry.manifest.contributes.observer {
 				let created = conn
-					.call("observer.create", json!({ "kind": kind, "cfg": cfg }))
+					.call("observer.create", json!({ "kind": kind, "cfg": entry.cfg(cfg) }))
 					.await?;
 				if let Some(instance) = created.get("instance").and_then(Value::as_u64) {
 					observers.push(Arc::new(RemoteObserver::spawn(conn.clone(), instance)));
