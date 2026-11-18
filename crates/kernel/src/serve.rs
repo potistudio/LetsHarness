@@ -63,12 +63,13 @@ pub trait AgentBackendFactory: Send + Sync {
 }
 
 /// ツールの供給元。
+#[async_trait::async_trait]
 pub trait ToolFactory: Send + Sync {
 	/// manifest の `contributes.tool` と一致させる。
 	fn name(&self) -> &'static str;
 
-	/// `cfg.workdir` があれば作業ディレクトリ。
-	fn create(&self, cfg: &Value) -> Result<Vec<Arc<dyn Tool>>>;
+	/// `cfg.workdir` があれば作業ディレクトリ。接続が要るツール (MCP サーバーなど) はここでつなぐ。
+	async fn create(&self, cfg: &Value) -> Result<Vec<Arc<dyn Tool>>>;
 }
 
 /// ループに割り込む [`Hook`] の供給元。
@@ -340,7 +341,7 @@ impl Inner {
 					.find(|f| f.name() == kind)
 					.ok_or_else(|| Error::Config(format!("unknown tool source: {kind}")))?;
 				let mut infos = Vec::new();
-				for tool in factory.create(params.get("cfg").unwrap_or(&Value::Null))? {
+				for tool in factory.create(params.get("cfg").unwrap_or(&Value::Null)).await? {
 					let id = self.instance_id();
 					infos.push(json!({ "id": id, "spec": tool.spec() }));
 					self.tools.lock().unwrap().insert(id, tool);

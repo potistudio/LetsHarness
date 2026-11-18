@@ -13,12 +13,13 @@ pub fn server() -> PluginServer {
 
 struct LocalToolFactory;
 
+#[async_trait::async_trait]
 impl ToolFactory for LocalToolFactory {
 	fn name(&self) -> &'static str {
 		"local"
 	}
 
-	fn create(&self, cfg: &Value) -> Result<Vec<Arc<dyn Tool>>> {
+	async fn create(&self, cfg: &Value) -> Result<Vec<Arc<dyn Tool>>> {
 		let workdir = cfg.get("workdir").and_then(Value::as_str).unwrap_or(".");
 		Ok(local_tools(workdir))
 	}

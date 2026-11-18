@@ -73,6 +73,16 @@ prefix = ">> "
 ```
 
 `--provider` takes one of these names or a provider kind; `-o KEY=VALUE` still overrides the table.
+
+Tools of MCP servers (stdio or Streamable HTTP) show up as `mcp__<server>__<tool>`. Configure them for the `mcp` plugin in the profile patch,
+or point it at an existing `.mcp.json` with `-o mcp_config=.mcp.json`:
+
+```toml
+# ~/.letsharness/profiles/default/patch.toml
+[[plugins]]
+id = "mcp"
+config.mcp_servers.fs = { command = "npx", args = ["-y", "@modelcontextprotocol/server-filesystem", "."] }
+```
 See [docs/architecture.md](docs/architecture.md) for how plugins are discovered and written.
 
 ## License

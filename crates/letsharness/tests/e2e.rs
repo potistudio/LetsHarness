@@ -14,6 +14,7 @@ const PLUGINS: &[&str] = &[
 	"letsharness-agent-antigravity",
 	"letsharness-hook-guard",
 	"letsharness-observer-log",
+	"letsharness-tool-mcp",
 ];
 
 fn plugin_dir() -> PathBuf {
@@ -30,7 +31,17 @@ fn build_plugins() {
 			cmd.args(["-p", p]);
 		}
 		assert!(cmd.status().expect("cargo build").success(), "プラグインのビルドに失敗");
+		// MCP のテスト用サーバー (examples はプラグインと別に指定する)
+		let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+		cmd.args(["build", "-q", "-p", "letsharness-tool-mcp", "--example", "mcp-echo"]);
+		assert!(cmd.status().expect("cargo build").success(), "mcp-echo のビルドに失敗");
 	});
+}
+
+/// テスト用の MCP サーバー (`crates/tool-mcp/examples/mcp-echo.rs`)。
+fn mcp_echo() -> PathBuf {
+	let bin = PathBuf::from(env!("CARGO_BIN_EXE_letsharness"));
+	bin.parent().unwrap().join("examples").join("mcp-echo")
 }
 
 /// profile を持たない LetsHarness の置き場 (利用者の `~/.letsharness` を読み書きしないため)。セッションログはここに溜まる。
@@ -361,6 +372,62 @@ fn patch_layers_configure_plugins() {
 	let out = letsharness(&["--patch", bad.to_str().unwrap(), "--provider", "mock", "models"]);
 	assert!(!out.status.success());
 	assert!(stderr(&out).contains("unknown plugin `nope`"), "{}", stderr(&out));
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// MCP サーバーのツールは `mcp__<server>__<tool>` としてループで使える。
+#[test]
+fn mcp_server_tools_run_in_the_loop() {
+	build_plugins();
+	let dir = std::env::temp_dir().join(format!("lh-e2e-mcp-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let servers = serde_json::json!({
+		"echo": { "command": mcp_echo(), "env": { "MCP_ECHO_TAG": "${LH_E2E_TAG:-tagged}" } },
+	});
+	let run = |prompt: &str| {
+		letsharness(&[
+			"--provider",
+			"mock",
+			"-o",
+			&format!("mcp_servers={servers}"),
+			"loop",
+			"--model",
+			"m",
+			"--workdir",
+			dir.to_str().unwrap(),
+			"--prompt",
+			prompt,
+		])
+	};
+
+	let out = run(r#"tool:mcp__echo__echo {"text":"hello mcp"}"#);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert_eq!(stdout(&out).trim(), "[mock] tool result: hello mcp");
+	// 2ページ目のツールも見える。作業ディレクトリは --workdir、env の ${VAR:-既定} は展開される
+	let out = run("tool:mcp__echo__where");
+	let text = stdout(&out);
+	let canon = dir.canonicalize().unwrap();
+	assert!(
+		text.contains(canon.to_str().unwrap()) && text.trim_end().ends_with("tagged"),
+		"{text}"
+	);
+	let out = run("tool:mcp__echo__fail");
+	assert_eq!(stdout(&out).trim(), "[mock] tool result: Error: it failed");
+
+	// つなげないサーバーは黙って飛ばさない
+	let out = letsharness(&[
+		"--provider",
+		"mock",
+		"-o",
+		r#"mcp_servers={"bad": {"command": "/no/such/mcp-server"}}"#,
+		"loop",
+		"--model",
+		"m",
+		"--prompt",
+		"hi",
+	]);
+	assert!(!out.status.success());
+	assert!(stderr(&out).contains("bad: /no/such/mcp-server"), "{}", stderr(&out));
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 

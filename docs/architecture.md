@@ -15,7 +15,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 | `letsharness` (Client) | CLI。`Kernel::boot` で kernel を動かし、`Host` に `kind` 名で頼む | **kernel のみ** (+ clap 等) |
 | `provider-*` | 各社 API の実装。`bin` + `plugin.toml` | kernel (+ reqwest 等) |
 | `agent-*` | 外部エージェント (自分でループもツールも持つもの) を `AgentBackend` として包む。`bin` + `plugin.toml` (例: `agent-antigravity`) | kernel (+ tokio::process 等) |
-| `tool-*` | エージェントが呼ぶツール。`bin` + `plugin.toml` (例: `tool-local`) | kernel |
+| `tool-*` | エージェントが呼ぶツール。`bin` + `plugin.toml` (例: `tool-local`、MCP クライアントの `tool-mcp`) | kernel (+ reqwest 等) |
 | `hook-*` | ループ (`run_loop`) に割り込む Hook。`bin` + `plugin.toml` (例: `hook-guard`) | kernel |
 | `observer-*` | ループの出来事を見るだけの Observer。`bin` + `plugin.toml` (例: `observer-log`) | kernel |
 | `plugin-*` | 起動時フックなど。`bin` + `plugin.toml` (例: `plugin-dotenv`) | kernel |
@@ -193,14 +193,33 @@ prefix = ">> "
   - プラグイン → kernel の通知: `stream.delta` / `stream.thinking` (`provider.chat` の差分。応答は `Completion`) と `agent.on_*`。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
-- Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。
+- Tool は MCP クライアント (`crates/tool-mcp`) で、既存の MCP サーバーをそのまま `dyn Tool` として使う ([MCP](#mcp))。Provider には MCP 相当の標準がないため独自プロトコル。
+
+## MCP
+
+`crates/tool-mcp` (プラグイン名 `mcp`、`contributes.tool = ["mcp"]`) が MCP サーバーにつなぎ、そのツールを `mcp__<server>__<tool>` という名前のツールとして供給する。kernel は MCP を知らない (ほかのツールと同じ `tool.create` / `tool.call`)。
+
+- つなぐサーバーは cfg で決める。`mcp_servers` (サーバー名 → 設定。パッチ層の `config` に書くか、`-o mcp_servers='<JSON>'`) と `mcp_config` (`.mcp.json` 形 `{"mcpServers": {...}}` のファイル)。どちらも無ければツールは無い。同じ名前は `mcp_servers` が勝つ。
+- サーバーの設定は `command` / `args` / `env` / `cwd` (stdio) か `type = "http"` + `url` / `headers` (Streamable HTTP)。古い HTTP+SSE (`type = "sse"`) は未対応で、起動を止める。文字列の `${VAR}` / `${VAR:-既定}` は環境変数に置き換える。
+- stdio のサーバーの作業ディレクトリは `cwd` (相対なら `cfg.workdir` から)、無ければ `cfg.workdir` (`loop --workdir`)。サーバーの標準エラーは表示せず、落ちたときのエラーに最後の数行を添える。
+- 使うメソッドは `initialize` → `notifications/initialized` → `tools/list` (`nextCursor` を追う) / `tools/call`。サーバーからのリクエストは `ping` にだけ答える。`timeout_secs` (既定 300) が1回の呼び出し、`startup_timeout_secs` (既定 60) が `initialize` の上限。
+- 結果の `text` はそのまま、`resource` は中身のテキスト、画像などは `[image: image/png]` のように種類だけをモデルに返す。テキストが無く `structuredContent` があればその JSON。`isError` はツールの失敗になる。
+- つなげないサーバーがあれば Session を作るところで止める (黙って飛ばさない)。同じ設定のサーバーへの接続はプラグインの中で使い回す。
+
+```toml
+# <home>/profiles/default/patch.toml
+[[plugins]]
+id = "mcp"
+config.mcp_servers.fs = { command = "npx", args = ["-y", "@modelcontextprotocol/server-filesystem", "."] }
+config.mcp_servers.docs = { type = "http", url = "https://example.com/mcp", headers = { Authorization = "Bearer ${DOCS_TOKEN}" } }
+```
 
 ## Roadmap
 
 1. **完了**: `Provider` trait を `chat(model, req) -> ChatStream` 1本に作り直し、wire 選択を各プロバイダへ移した (commandcode は `Wire::for_model`、`wire` で決め打ち)。設定ファイル (`default_provider` / `[providers.x]`) を導入した。
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
 3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` も実装済みで、`chat` / GUI にも Hook と Observer が効く。会話の履歴は `Session` が持ち、セッションログから `--resume` で再開できる。
-4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) は実装済み。
+4. **完了**: MCP クライアント (`crates/tool-mcp`、stdio / Streamable HTTP)。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) も実装済み。
 5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。profile とパッチ層 (有効/無効・並び順・プラグインごとの設定・`path` での追加) と `letsharness plugin list/enable/disable` は実装済み。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
 
@@ -303,7 +322,7 @@ classDiagram
   class ToolFactory {
     <<interface>>
     +name() str
-    +create(cfg) Vec~Tool~
+    +create(cfg) async Vec~Tool~
   }
   class HookFactory {
     <<interface>>
@@ -326,6 +345,7 @@ classDiagram
   class ProviderMock
   class AgentAntigravity
   class ToolLocal
+  class ToolMcp
   class PluginDotenv
   class HookGuard
   class ObserverLog
@@ -370,6 +390,7 @@ classDiagram
   ProviderFactory <|.. ProviderMock
   AgentBackendFactory <|.. AgentAntigravity
   ToolFactory <|.. ToolLocal
+  ToolFactory <|.. ToolMcp
   HookFactory <|.. HookGuard
   ObserverFactory <|.. ObserverLog
   BootHook <|.. PluginDotenv

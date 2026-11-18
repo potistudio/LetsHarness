@@ -1,0 +1,5 @@
+name = "mcp"
+command = "letsharness-tool-mcp"
+
+[contributes]
+tool = ["mcp"]
