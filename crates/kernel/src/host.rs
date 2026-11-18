@@ -3,6 +3,7 @@
 //! Client は `Host` に `kind` 名で頼むだけで、どのプラグインが提供しているか・
 //! どう通信しているかは知らない。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
@@ -10,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::external::{Connection, EventSink, NoEvents, PluginEntry};
+use crate::session_log::{self, SessionId, log_path};
 use crate::{
 	AgentBackend, AgentOutcome, AgentRequest, ChatMessage, ChatOutput, Completion, Error, Event, Hook, HookPoint,
 	HookRegistry, ModelInfo, ModelRequest, Observer, Provider, Quota, Result, RunHandler, Session, Tool, ToolCall,
@@ -18,12 +20,14 @@ use crate::{
 
 pub struct Host {
 	entries: Arc<Vec<Arc<PluginEntry>>>,
+	sessions_dir: Option<PathBuf>,
 }
 
 impl Host {
-	pub(crate) fn new(entries: Vec<Arc<PluginEntry>>) -> Self {
+	pub(crate) fn new(entries: Vec<Arc<PluginEntry>>, sessions_dir: Option<PathBuf>) -> Self {
 		Self {
 			entries: Arc::new(entries),
+			sessions_dir,
 		}
 	}
 
@@ -35,14 +39,32 @@ impl Host {
 	/// `kind` の Provider と、すべてのツール・Hook・Observer をまとめた [`Session`] を作る。
 	///
 	/// Client がモデルを使う窓口はこれだけ。ツールより後に Hook を作るので、Hook はツールを見て設定を検証できる。
+	///
+	/// 会話はセッションログ (`<sessions_dir>/<id>.jsonl`) に残り、[`resume`](Self::resume) で再開できる。
 	pub async fn session(&self, provider: &str, cfg: &Value) -> Result<Session> {
+		let (p, tools, hooks) = self.parts(provider, cfg).await?;
+		Ok(Session::create(provider, p, tools, hooks, self.sessions_dir.clone()))
+	}
+
+	/// セッションログから会話を復元し、続きから再開する。Provider はログに残った kind を使い、`cfg` は今回のもの。
+	pub async fn resume(&self, id: &SessionId, cfg: &Value) -> Result<Session> {
+		let dir = self
+			.sessions_dir
+			.clone()
+			.ok_or_else(|| Error::Config("セッションの保存先がありません ($LETSHARNESS_HOME / $HOME)".into()))?;
+		let (kind, history) = session_log::read(&log_path(&dir, id), id)?;
+		let (p, tools, hooks) = self.parts(&kind, cfg).await?;
+		Ok(Session::resumed(p, &kind, tools, hooks, dir, id.clone(), history))
+	}
+
+	async fn parts(&self, provider: &str, cfg: &Value) -> Result<(Arc<dyn Provider>, ToolRegistry, HookRegistry)> {
 		let provider = self.provider(provider, cfg).await?;
 		let tools = self.tools(cfg).await?;
 		let mut hooks = self.hooks(cfg, &tools.specs()).await?;
 		for observer in self.observers(cfg).await? {
 			hooks.observe(observer);
 		}
-		Ok(Session::new(provider, tools, hooks))
+		Ok((provider, tools, hooks))
 	}
 
 	/// `kind` の Provider を作る (プラグインは初回に起動する)。

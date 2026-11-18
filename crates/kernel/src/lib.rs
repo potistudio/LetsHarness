@@ -21,6 +21,7 @@ mod rpc;
 mod run_loop;
 mod serve;
 mod session;
+mod session_log;
 mod tool;
 
 pub use agent::{AgentBackend, AgentOutcome, AgentRequest};
@@ -38,6 +39,7 @@ pub use serve::{
 	AgentBackendFactory, BootHook, HookFactory, ObserverFactory, PluginServer, ProviderFactory, ToolFactory,
 };
 pub use session::{Route, Session};
+pub use session_log::{LOG_VERSION, SessionId, log_path};
 pub use tool::{Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
 // ---------------------------------------------------------------------------

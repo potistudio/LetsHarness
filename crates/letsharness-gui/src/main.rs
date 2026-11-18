@@ -7,6 +7,7 @@
 mod fonts;
 mod style;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use iced::futures::channel::mpsc;
@@ -115,7 +116,7 @@ impl Conversation {
 		}
 	}
 
-	/// モデルに渡す履歴。失敗した応答は含めない。
+	/// 画面上の会話を履歴にしたもの (Session を作り直すときに引き継ぐ)。失敗した応答は含めない。
 	fn history(&self) -> Vec<ChatMessage> {
 		self.entries
 			.iter()
@@ -146,7 +147,10 @@ struct App {
 	options: Vec<(String, String)>,
 	providers: Vec<String>,
 	provider: Option<String>,
+	/// モデル一覧と、新しい会話を始める元になる Session (この Session 自身では会話しない)。
 	client: Option<Arc<Session>>,
+	/// 会話 (`conversations` の添字) ごとの Session。会話の履歴は Session が持つ。
+	sessions: HashMap<usize, Arc<Session>>,
 	models: Vec<String>,
 	model: Option<String>,
 	/// プロバイダ・モデル周りの問題 (認証不足など)。
@@ -192,6 +196,7 @@ impl App {
 			providers: Vec::new(),
 			provider: None,
 			client: None,
+			sessions: HashMap::new(),
 			models: Vec::new(),
 			model: None,
 			notice: None,
@@ -352,13 +357,22 @@ impl App {
 		self.composer = text_editor::Content::new();
 
 		let conversation = &mut self.conversations[self.current];
-		conversation.entries.push(Entry::new(Role::User, prompt));
-		let history = conversation.history();
+		let earlier = conversation.history();
+		conversation.entries.push(Entry::new(Role::User, prompt.clone()));
 		conversation.entries.push(Entry::new(Role::Assistant, String::new()));
+		// 初めての会話や、プロバイダを切り替えた会話は、ここまでの履歴を引き継いだ新しい Session で続ける。
+		let session = match self.sessions.get(&self.current) {
+			Some(s) if s.provider_kind() == client.provider_kind() => s.clone(),
+			_ => {
+				let s = Arc::new(client.fork(earlier));
+				self.sessions.insert(self.current, s.clone());
+				s
+			}
+		};
 
 		let id = self.next_id;
 		self.next_id += 1;
-		let (task, handle) = respond(client, model, history, id).abortable();
+		let (task, handle) = respond(session, model, ChatMessage::user(prompt), id).abortable();
 		self.running = Some(Running {
 			id,
 			conversation: self.current,
@@ -611,7 +625,7 @@ fn options_cfg(options: &[(String, String)]) -> serde_json::Value {
 /// 1ターン分の応答。差分は [`Message::Delta`]、最後に全文を [`Message::Finished`] で返す。
 ///
 /// `claude-*` は CLI と同じく `messages` wire (非ストリーム)、それ以外は `chat/completions` のストリーム。
-fn respond(client: Arc<Session>, model: String, history: Vec<ChatMessage>, id: u64) -> Task<Message> {
+fn respond(session: Arc<Session>, model: String, input: ChatMessage, id: u64) -> Task<Message> {
 	let (tx, rx) = mpsc::unbounded();
 	let work = async move {
 		let (route, max_tokens) = if model.starts_with("claude-") {
@@ -626,8 +640,8 @@ fn respond(client: Arc<Session>, model: String, history: Vec<ChatMessage>, id: u
 		let mut on_thinking = move |t: &str| {
 			let _ = thinking_tx.unbounded_send(Delta::Thinking(t.to_owned()));
 		};
-		client
-			.chat(route, &model, history, max_tokens, &mut on_delta, &mut on_thinking)
+		session
+			.chat(route, &model, vec![input], max_tokens, &mut on_delta, &mut on_thinking)
 			.await
 	};
 	Task::batch([

@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
-use letsharness_kernel::{self as llm, AgentBackend, BootConfig, ChatMessage, Host, Kernel, Route, Session};
+use letsharness_kernel::{self as llm, AgentBackend, BootConfig, ChatMessage, Host, Kernel, Route, Session, SessionId};
 
 fn main() -> ExitCode {
 	match run_cli() {
@@ -198,6 +198,9 @@ enum Cmd {
 		/// 思考過程 (reasoning / extended thinking) を表示しない (既定は表示)
 		#[arg(long, default_value_t = false)]
 		no_thinking: bool,
+		/// 前の会話を続きから再開する (終了時に表示される session ID)。プロバイダは会話のものを使う
+		#[arg(long, value_name = "SESSION_ID")]
+		resume: Option<String>,
 	},
 	/// GET /alpha/billing/credits (+ subscriptions / usage/summary) の正規化
 	///
@@ -231,6 +234,9 @@ enum Cmd {
 		/// 全ステップ合算の usage をstderrに表示
 		#[arg(long, default_value_t = false)]
 		show_usage: bool,
+		/// 前の会話を続きから再開する (終了時に表示される session ID)。プロバイダは会話のものを使う
+		#[arg(long, value_name = "SESSION_ID")]
+		resume: Option<String>,
 	},
 	/// 外部エージェント (--backend) に最終回答まで丸ごと任せる (非ストリーム)
 	///
@@ -300,6 +306,31 @@ async fn make_session(host: &Host, provider: &str, cfg: &Value) -> Result<Sessio
 			"{provider} はモデルではなくエージェントです: `--backend {provider} agent ...` を使ってください"
 		)),
 		Err(e) => Err(e.into()),
+	}
+}
+
+/// 新しい会話の Session か、`resume` の会話の続き。`--system` は新しい会話でだけ使える (履歴の途中に挟まないため)。
+async fn open_session(
+	host: &Host,
+	provider: &str,
+	cfg: &Value,
+	resume: Option<&str>,
+	system: Option<&String>,
+) -> Result<Session> {
+	let Some(id) = resume else {
+		return make_session(host, provider, cfg).await;
+	};
+	if system.is_some() {
+		bail!("--system は新しい会話でだけ使えます (--resume とは併用できません)");
+	}
+	Ok(host.resume(&SessionId::parse(id)?, cfg).await?)
+}
+
+/// 会話を続けるための ID を stderr へ。
+fn report_session(session: &Session) {
+	if session.is_logged() {
+		let id = session.id();
+		eprintln!("session: {id} (--resume {id} で続きから)");
 	}
 }
 
@@ -379,10 +410,13 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			show_usage,
 			json,
 			no_thinking,
+			resume,
 		} => {
 			ensure_provider_only(&cli.backend, "chat")?;
+			let cfg = options_cfg(&cli.options);
+			let session = open_session(host, &cli.provider, &cfg, resume.as_deref(), system.as_ref()).await?;
 			run_chat(
-				&session().await?,
+				&session,
 				model,
 				prompt,
 				system,
@@ -394,6 +428,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 				no_thinking,
 			)
 			.await?;
+			report_session(&session);
 		}
 		Cmd::Quota { json } => {
 			ensure_provider_only(&cli.backend, "quota")?;
@@ -408,13 +443,14 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			workdir,
 			no_thinking,
 			show_usage,
+			resume,
 		} => {
 			ensure_provider_only(&cli.backend, "loop")?;
 			// ツールの作業ディレクトリは `workdir`、プロバイダ固有の設定は `-o`。
 			let mut cfg = options_cfg(&cli.options);
 			cfg["workdir"] = json!(workdir);
 			exec::run_loop(
-				&make_session(host, &cli.provider, &cfg).await?,
+				&open_session(host, &cli.provider, &cfg, resume.as_deref(), system.as_ref()).await?,
 				exec::Options {
 					model,
 					prompt,

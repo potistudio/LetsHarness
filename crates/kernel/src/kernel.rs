@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::external::{Connection, PluginEntry, default_plugin_path, discover};
-use crate::profile::{DEFAULT_PROFILE, Layer, Patch, PluginState, compose, profile_patch_path};
+use crate::profile::{DEFAULT_PROFILE, Layer, Patch, PluginState, compose, home_dir, profile_patch_path};
 use crate::{Error, Host, Result};
 
 pub struct BootConfig {
@@ -22,16 +22,19 @@ pub struct BootConfig {
 	pub profile: Option<String>,
 	/// profile の後に順に重ねるパッチ (`--patch`)。ファイルが無ければ起動を止める。
 	pub patches: Vec<PathBuf>,
+	/// セッションログの保存先 (既定は `<home>/sessions`)。`None` ならログを残さず、再開もできない。
+	pub sessions_dir: Option<PathBuf>,
 }
 
 impl BootConfig {
-	/// 探索先は [`default_plugin_path`]、profile は `$LETSHARNESS_PROFILE` (無ければ [`DEFAULT_PROFILE`])。
+	/// 探索先は `default_plugin_path()`、profile は `$LETSHARNESS_PROFILE` (無ければ [`DEFAULT_PROFILE`])。
 	pub fn new(options: Vec<(String, String)>) -> Self {
 		Self {
 			options,
 			plugin_path: default_plugin_path(),
 			profile: Some(std::env::var("LETSHARNESS_PROFILE").unwrap_or_else(|_| DEFAULT_PROFILE.into())),
 			patches: Vec::new(),
+			sessions_dir: home_dir().map(|h| h.join("sessions")),
 		}
 	}
 
@@ -85,6 +88,6 @@ impl Kernel {
 			.into_iter()
 			.map(|p| Arc::new(PluginEntry::new(p.manifest, p.config, env.clone())))
 			.collect();
-		Ok(Host::new(entries))
+		Ok(Host::new(entries, config.sessions_dir))
 	}
 }

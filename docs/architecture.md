@@ -76,13 +76,26 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 
 ## Session
 
-`Host::session(kind, cfg)` が Provider・ツール・Hook・Observer をひとまとめにした `Session` を作る。Client がモデルを使う窓口はこれだけ (CLI の `models` / `chat` / `quota` / `loop` も GUI も)。
+`Host::session(kind, cfg)` が Provider・ツール・Hook・Observer をひとまとめにした `Session` を作る。Client がモデルを使う窓口はこれだけ (CLI の `models` / `chat` / `quota` / `loop` も GUI も)。1つの `Session` が1つの会話で、会話の履歴は `Session` が持つ。Client は毎ターンの新しいメッセージだけを渡す。
 
-- `Session::chat(route, model, messages, max_tokens, on_delta, on_thinking)`: ツールを使わない1回の呼び出し。`before_request` / `after_response` の Hook を通し、Observer に知らせる。`route` (`Chat` / `Stream` / `Responses` / `Messages`) は Provider のどの呼び方を使うか。ストリームの差分は Hook を通す前の本文で、Hook の書き換えは戻り値にだけ効く。
-- `Session::run_loop(req, handler)`: ツールを使いながら最終回答まで (下の Loop)。
+- `Session::chat(route, model, input, max_tokens, on_delta, on_thinking)`: ツールを使わない1回の呼び出し。`input` を履歴に続けて送る。`before_request` / `after_response` の Hook を通し、Observer に知らせる。`route` (`Chat` / `Stream` / `Responses` / `Messages`) は Provider のどの呼び方を使うか。ストリームの差分は Hook を通す前の本文で、Hook の書き換えは戻り値にだけ効く。
+- `Session::run_loop(req, handler)`: ツールを使いながら最終回答まで (下の Loop)。`req.messages` はこのターンの新しいメッセージ。
+- 成功したターンだけが履歴に加わる (ループは途中のツール往復ごと)。失敗・中断したターンは履歴に残らない。同じ `Session` のターンは1つずつ進む。
+- `before_request` の書き換えはリクエストにだけ効き、履歴には入らない。`after_response` の書き換えは履歴に入る。
 - どちらも返る前に Observer を flush する。
 - ツールは Hook より先に作り、その一覧を Hook の `create` に渡す。
-- 会話の履歴は今のところ Client が持ち、呼び出しごとに渡す。
+- `Session::fork(history)` は同じ Provider・ツール・Hook で、`history` から始まる別の会話を作る (プラグインとやりとりしない)。GUI は会話ごとに fork し、プロバイダを切り替えた会話は画面の履歴を引き継いで fork し直す。
+
+### セッションログ
+
+会話は `<home>/sessions/<id>.jsonl` (`BootConfig::sessions_dir`) に追記だけで残る。最初に書くときにファイルを作るので、`models` などで会話しなかった Session はファイルを作らない。
+
+- 1行目は見出し `{"type":"session","version","id","provider"}`。
+- `{"type":"event", ...}`: Hook を通した後にモデル・ツールとやりとりした値 (Observer と同じ `request` / `response` / `tool_result`)。モデルに何が見えたか (`before_request` の書き換えを含む) はここに残る。
+- `{"type":"message","message"}`: 履歴に加わったメッセージ。ターンが成功したときにまとめて書く。
+- `Host::resume(id, cfg)` は `message` だけを読んで履歴を復元し、同じファイルに続きを書く。Provider はログの `provider` を使う。見出しが無い・版が違う・途中の行が壊れているログは読まずに止める (改行で終わらない最後の行だけは書きかけとして警告して捨てる)。
+- CLI は `chat` / `loop` の後に `session: <id>` を表示し、`--resume <id>` で続ける。`--resume` では `--system` は使えない (履歴の途中に挟まないため)。
+- ログに書けなくても会話は止めずに警告し、書けなかった分は次のターンで書き直す。
 
 ## Provider / Loop / Agent
 
@@ -180,7 +193,7 @@ path = "~/.letsharness/plugins/openai-compat"
 
 1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。設定ファイル (`default_provider` / `[providers.x]`) を導入する。いまの `Provider` は多数のメソッドを持ち、そのまま線の上を流れている。
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
-3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` も実装済みで、`chat` / GUI にも Hook と Observer が効く。会話の履歴を `Session` に持たせるのは未着手。
+3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` も実装済みで、`chat` / GUI にも Hook と Observer が効く。会話の履歴は `Session` が持ち、セッションログから `--resume` で再開できる。
 4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) は実装済み。
 5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。profile とパッチ層 (有効/無効・並び順・プラグインごとの設定・`path` での追加) と `letsharness plugin list/enable/disable` は実装済み。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
@@ -213,12 +226,15 @@ classDiagram
   }
   class Host {
     +session(kind, cfg) Session
+    +resume(id, cfg) Session
     +agent_backend(kind, cfg) Arc~dyn AgentBackend~
     +has_agent_backend(kind) bool
   }
   class Session {
-    +chat(route, model, messages, max_tokens, on_delta, on_thinking) ChatOutput
+    +chat(route, model, input, max_tokens, on_delta, on_thinking) ChatOutput
     +run_loop(req, handler) LoopOutcome
+    +fork(history) Session
+    +history() Vec~ChatMessage~
     +list_models() Vec~ModelInfo~
     +quota() Quota
   }

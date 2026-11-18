@@ -46,12 +46,13 @@ pub async fn run_loop(session: &Session, opts: Options) -> Result<()> {
 	};
 
 	let out = session.run_loop(req, &mut handler).await?;
+	let id = session.is_logged().then(|| session.id().to_string());
 	report(
 		&opts,
 		&out.text,
 		out.usage.as_ref(),
 		out.steps,
-		None,
+		id.as_deref(),
 		out.hit_step_limit,
 	)
 }

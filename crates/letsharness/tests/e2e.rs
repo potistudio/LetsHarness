@@ -33,13 +33,13 @@ fn build_plugins() {
 	});
 }
 
-/// 何も書かれていない LetsHarness の置き場 (利用者の `~/.letsharness` の profile を読まないため)。
-fn empty_home() -> PathBuf {
-	std::env::temp_dir().join(format!("lh-e2e-home-{}-empty", std::process::id()))
+/// profile を持たない LetsHarness の置き場 (利用者の `~/.letsharness` を読み書きしないため)。セッションログはここに溜まる。
+fn scratch_home() -> PathBuf {
+	std::env::temp_dir().join(format!("lh-e2e-home-{}", std::process::id()))
 }
 
 fn letsharness(args: &[&str]) -> Output {
-	letsharness_in(&empty_home(), args)
+	letsharness_in(&scratch_home(), args)
 }
 
 /// `home` を `$LETSHARNESS_HOME` にして動かす (profile を読み書きするテスト用)。
@@ -136,7 +136,7 @@ fn kernel_runs_without_any_plugin() {
 	let out = Command::new(env!("CARGO_BIN_EXE_letsharness"))
 		.args(["--provider", "mock", "models"])
 		.env("LETSHARNESS_PLUGIN_PATH", "/nonexistent")
-		.env("LETSHARNESS_HOME", empty_home())
+		.env("LETSHARNESS_HOME", scratch_home())
 		.output()
 		.unwrap();
 	assert!(!out.status.success());
@@ -363,6 +363,52 @@ fn patch_layers_configure_plugins() {
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// 会話はセッションログに残り、`--resume` で前のターンを含めて続けられる。
+#[test]
+fn conversations_are_logged_and_resumed() {
+	let home = std::env::temp_dir().join(format!("lh-e2e-resume-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&home);
+	let chat = |extra: &[&str]| {
+		let args = [&["--provider", "mock", "chat", "--model", "m"][..], extra].concat();
+		letsharness_in(&home, &args)
+	};
+
+	let out = chat(&["--prompt", "first"]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	let err = stderr(&out);
+	let id = err
+		.lines()
+		.find_map(|l| l.strip_prefix("session: "))
+		.and_then(|l| l.split_whitespace().next())
+		.unwrap_or_else(|| panic!("session id is reported: {err}"))
+		.to_owned();
+
+	let out = chat(&["--prompt", "second", "--resume", &id]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert_eq!(stdout(&out).trim(), "[mock] m: second");
+
+	let log = std::fs::read_to_string(home.join(format!("sessions/{id}.jsonl"))).unwrap();
+	let records: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+	let of = |t: &str| records.iter().filter(|r| r["type"] == t).collect::<Vec<_>>();
+	assert_eq!(of("session").len(), 1);
+	let messages: Vec<&str> = of("message")
+		.iter()
+		.map(|r| r["message"]["content"].as_str().unwrap())
+		.collect();
+	assert_eq!(messages, ["first", "[mock] m: first", "second", "[mock] m: second"]);
+	// 再開したターンのリクエストには前のターンが含まれる
+	let last_request = of("event").into_iter().rfind(|r| r["event"] == "request").unwrap();
+	assert_eq!(last_request["request"]["messages"].as_array().unwrap().len(), 3);
+
+	let out = chat(&["--prompt", "x", "--resume", &id, "--system", "s"]);
+	assert!(!out.status.success());
+	assert!(stderr(&out).contains("--system は新しい会話でだけ"), "{}", stderr(&out));
+	let out = chat(&["--prompt", "x", "--resume", "no-such-session"]);
+	assert!(!out.status.success());
+	assert!(stderr(&out).contains("session no-such-session"), "{}", stderr(&out));
+	std::fs::remove_dir_all(&home).unwrap();
+}
+
 #[test]
 fn dotenv_boot_options_are_validated() {
 	let out = letsharness(&[
@@ -406,7 +452,7 @@ EOF
 		.arg(&dir)
 		.env("LETSHARNESS_PLUGIN_PATH", plugin_dir())
 		.env("AGY_BIN", &agy)
-		.env("LETSHARNESS_HOME", empty_home())
+		.env("LETSHARNESS_HOME", scratch_home())
 		.output()
 		.unwrap();
 	let (so, se) = (stdout(&out), stderr(&out));
