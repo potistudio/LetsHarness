@@ -19,6 +19,7 @@ mod observe;
 mod rpc;
 mod run_loop;
 mod serve;
+mod session;
 mod tool;
 
 pub use agent::{AgentBackend, AgentOutcome, AgentRequest};
@@ -32,6 +33,7 @@ pub use run_loop::{LoopOutcome, LoopRequest, run_loop};
 pub use serve::{
 	AgentBackendFactory, BootHook, HookFactory, ObserverFactory, PluginServer, ProviderFactory, ToolFactory,
 };
+pub use session::{Route, Session};
 pub use tool::{Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
 // ---------------------------------------------------------------------------

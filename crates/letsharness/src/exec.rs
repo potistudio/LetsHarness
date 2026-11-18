@@ -5,8 +5,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use letsharness_kernel::{self as llm, AgentBackend, ChatMessage, Host};
-use serde_json::Value;
+use letsharness_kernel::{self as llm, AgentBackend, ChatMessage, Session};
 
 use crate::format_usage;
 
@@ -34,8 +33,8 @@ impl Options {
 	}
 }
 
-/// kernel のループを回す (`--provider` のモデル + ツール)。
-pub async fn run_loop(host: &Host, provider: &str, cfg: &Value, opts: Options) -> Result<()> {
+/// kernel のループを回す (`--provider` のモデル + ツール + Hook)。
+pub async fn run_loop(session: &Session, opts: Options) -> Result<()> {
 	if opts.model.is_empty() {
 		bail!("loop には --model が必要です");
 	}
@@ -46,7 +45,7 @@ pub async fn run_loop(host: &Host, provider: &str, cfg: &Value, opts: Options) -
 		no_thinking: opts.no_thinking,
 	};
 
-	let out = host.run_loop(provider, cfg, req, &mut handler).await?;
+	let out = session.run_loop(req, &mut handler).await?;
 	report(
 		&opts,
 		&out.text,

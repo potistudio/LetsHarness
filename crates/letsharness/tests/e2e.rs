@@ -233,6 +233,44 @@ fn observer_plugin_sees_loop_events_in_order() {
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `chat` もループと同じく Session を通るので、Observer に届く。
+#[test]
+fn chat_goes_through_the_session() {
+	let log = std::env::temp_dir().join(format!("lh-e2e-chat-{}.jsonl", std::process::id()));
+	let _ = std::fs::remove_file(&log);
+	for stream in [false, true] {
+		let mut args = vec![
+			"--provider".to_string(),
+			"mock".into(),
+			"-o".into(),
+			format!("event_log={}", log.display()),
+			"chat".into(),
+			"--model".into(),
+			"m".into(),
+			"--prompt".into(),
+			"hi".into(),
+		];
+		if stream {
+			args.push("--stream".into());
+		}
+		let out = letsharness(&args.iter().map(String::as_str).collect::<Vec<_>>());
+		assert!(out.status.success(), "{}", stderr(&out));
+		assert_eq!(stdout(&out).trim(), "[mock] m: hi");
+	}
+	let text = std::fs::read_to_string(&log).unwrap();
+	let kinds: Vec<String> = text
+		.lines()
+		.map(|l| {
+			serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
+				.as_str()
+				.unwrap()
+				.to_owned()
+		})
+		.collect();
+	assert_eq!(kinds, ["request", "response", "request", "response"]);
+	std::fs::remove_file(&log).unwrap();
+}
+
 #[test]
 fn dotenv_boot_options_are_validated() {
 	let out = letsharness(&[

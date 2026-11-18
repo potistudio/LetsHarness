@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::external::{Connection, EventSink, NoEvents, PluginEntry};
 use crate::{
 	AgentBackend, AgentOutcome, AgentRequest, ChatMessage, ChatOutput, Completion, Error, Event, Hook, HookPoint,
-	HookRegistry, LoopOutcome, LoopRequest, ModelInfo, ModelRequest, Observer, Provider, Quota, Result, RunHandler,
-	Tool, ToolCall, ToolDecision, ToolOutput, ToolRegistry, ToolSpec, run_loop,
+	HookRegistry, ModelInfo, ModelRequest, Observer, Provider, Quota, Result, RunHandler, Session, Tool, ToolCall,
+	ToolDecision, ToolOutput, ToolRegistry, ToolSpec,
 };
 
 pub struct Host {
@@ -32,8 +32,21 @@ impl Host {
 		self.entries.iter().map(|e| e.manifest.name.as_str()).collect()
 	}
 
+	/// `kind` の Provider と、すべてのツール・Hook・Observer をまとめた [`Session`] を作る。
+	///
+	/// Client がモデルを使う窓口はこれだけ。ツールより後に Hook を作るので、Hook はツールを見て設定を検証できる。
+	pub async fn session(&self, provider: &str, cfg: &Value) -> Result<Session> {
+		let provider = self.provider(provider, cfg).await?;
+		let tools = self.tools(cfg).await?;
+		let mut hooks = self.hooks(cfg, &tools.specs()).await?;
+		for observer in self.observers(cfg).await? {
+			hooks.observe(observer);
+		}
+		Ok(Session::new(provider, tools, hooks))
+	}
+
 	/// `kind` の Provider を作る (プラグインは初回に起動する)。
-	pub async fn provider(&self, kind: &str, cfg: &Value) -> Result<Arc<dyn Provider>> {
+	pub(crate) async fn provider(&self, kind: &str, cfg: &Value) -> Result<Arc<dyn Provider>> {
 		let entry = self
 			.entries
 			.iter()
@@ -75,7 +88,7 @@ impl Host {
 	}
 
 	/// ツールを供給するすべてのプラグインからツールを集める。
-	pub async fn tools(&self, cfg: &Value) -> Result<ToolRegistry> {
+	pub(crate) async fn tools(&self, cfg: &Value) -> Result<ToolRegistry> {
 		let mut tools = ToolRegistry::new();
 		for entry in self.entries.iter().filter(|e| !e.manifest.contributes.tool.is_empty()) {
 			let conn = entry.connection().await?;
@@ -99,7 +112,7 @@ impl Host {
 	/// Hook を提供するすべてのプラグインから Hook を集める。並びはプラグインの発見順 → manifest の記載順。
 	///
 	/// `tools` は同じループで使うツール。Hook はこれを見て設定を検証できる (存在しないツール名など)。
-	pub async fn hooks(&self, cfg: &Value, tools: &[ToolSpec]) -> Result<HookRegistry> {
+	pub(crate) async fn hooks(&self, cfg: &Value, tools: &[ToolSpec]) -> Result<HookRegistry> {
 		let mut hooks = HookRegistry::new();
 		for entry in self.entries.iter().filter(|e| !e.manifest.contributes.hook.is_empty()) {
 			let conn = entry.connection().await?;
@@ -129,7 +142,7 @@ impl Host {
 	}
 
 	/// Observer を提供するすべてのプラグインから Observer を集める。設定次第で見ないものは含まない。
-	pub async fn observers(&self, cfg: &Value) -> Result<Vec<Arc<dyn Observer>>> {
+	pub(crate) async fn observers(&self, cfg: &Value) -> Result<Vec<Arc<dyn Observer>>> {
 		let mut observers: Vec<Arc<dyn Observer>> = Vec::new();
 		for entry in self
 			.entries
@@ -147,27 +160,6 @@ impl Host {
 			}
 		}
 		Ok(observers)
-	}
-
-	/// `provider` のモデルと、すべてのツール・Hook でループを回す ([`run_loop`])。
-	///
-	/// ループは kernel の責務で、モデルもツールも Hook も `Host` が引いたものをそのまま使う。
-	pub async fn run_loop(
-		&self,
-		provider: &str,
-		cfg: &Value,
-		req: LoopRequest,
-		handler: &mut dyn RunHandler,
-	) -> Result<LoopOutcome> {
-		let provider = self.provider(provider, cfg).await?;
-		let tools = self.tools(cfg).await?;
-		let mut hooks = self.hooks(cfg, &tools.specs()).await?;
-		for observer in self.observers(cfg).await? {
-			hooks.observe(observer);
-		}
-		let out = run_loop(&*provider, &tools, &hooks, handler, req).await;
-		hooks.flush().await;
-		out
 	}
 
 	fn kinds<'a>(&'a self, pick: impl Fn(&'a crate::external::Contributes) -> &'a Vec<String>) -> Vec<&'a str> {

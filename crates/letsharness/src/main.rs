@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
-use letsharness_kernel::{self as llm, AgentBackend, BootConfig, ChatMessage, Host, Kernel, Provider};
+use letsharness_kernel::{self as llm, AgentBackend, BootConfig, ChatMessage, Host, Kernel, Route, Session};
 
 fn main() -> ExitCode {
 	match run_cli() {
@@ -174,10 +174,10 @@ fn options_cfg(options: &[(String, String)]) -> Value {
 	)
 }
 
-/// kernel に Provider を頼む。
-async fn make_client(host: &Host, provider: &str, options: &[(String, String)]) -> Result<Arc<dyn Provider>> {
-	match host.provider(provider, &options_cfg(options)).await {
-		Ok(p) => Ok(p),
+/// kernel に Session (Provider + ツール + Hook + Observer) を頼む。モデルはこれ経由でしか使わない。
+async fn make_session(host: &Host, provider: &str, cfg: &Value) -> Result<Session> {
+	match host.session(provider, cfg).await {
+		Ok(s) => Ok(s),
 		Err(_) if host.has_agent_backend(provider) => Err(anyhow!(
 			"{provider} はモデルではなくエージェントです: `--backend {provider} agent ...` を使ってください"
 		)),
@@ -209,7 +209,7 @@ fn ensure_provider_only(backend: &Option<String>, command: &str) -> Result<()> {
 
 async fn run(host: &Host, cli: Cli) -> Result<()> {
 	// 外部エージェントだけ使うときに Provider の認証を要求しないよう、必要になるまで作らない。
-	let client = || make_client(host, &cli.provider, &cli.options);
+	let session = || async { make_session(host, &cli.provider, &options_cfg(&cli.options)).await };
 
 	match cli.cmd {
 		Cmd::Models { limit, json } => {
@@ -220,8 +220,8 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 					(agent.name(), agent.list_models().await)
 				}
 				None => {
-					let client = client().await?;
-					(client.name(), client.list_models().await)
+					let session = session().await?;
+					(session.provider_name(), session.list_models().await)
 				}
 			};
 			let models = models?;
@@ -264,7 +264,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 		} => {
 			ensure_provider_only(&cli.backend, "chat")?;
 			run_chat(
-				&*client().await?,
+				&session().await?,
 				model,
 				prompt,
 				system,
@@ -279,7 +279,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 		}
 		Cmd::Quota { json } => {
 			ensure_provider_only(&cli.backend, "quota")?;
-			run_quota(&*client().await?, json).await?;
+			run_quota(&session().await?, json).await?;
 		}
 		Cmd::Loop {
 			model,
@@ -296,9 +296,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			let mut cfg = options_cfg(&cli.options);
 			cfg["workdir"] = json!(workdir);
 			exec::run_loop(
-				host,
-				&cli.provider,
-				&cfg,
+				&make_session(host, &cli.provider, &cfg).await?,
 				exec::Options {
 					model,
 					prompt,
@@ -349,11 +347,10 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 	Ok(())
 }
 
-/// ハーネス本体の例: 具象型ではなく `&dyn LlmClient` / `impl LlmClient` に依存する.
-/// この関数は commandcode / mock のどちらでも動く.
+/// 1回のモデル呼び出し。どのプロバイダでも同じコードで、Hook と Observer は Session が効かせる。
 #[allow(clippy::too_many_arguments)]
 async fn run_chat(
-	client: &dyn Provider,
+	session: &Session,
 	model: String,
 	prompt: String,
 	system: Option<String>,
@@ -365,9 +362,10 @@ async fn run_chat(
 	no_thinking: bool,
 ) -> Result<()> {
 	use std::io::Write;
+	use std::sync::atomic::{AtomicBool, Ordering};
 
 	let mut msgs: Vec<ChatMessage> = Vec::new();
-	if let Some(s) = system.clone() {
+	if let Some(s) = system {
 		msgs.push(ChatMessage::system(s));
 	}
 	msgs.push(ChatMessage::user(prompt));
@@ -379,7 +377,7 @@ async fn run_chat(
 		"messages".to_string()
 	} else {
 		// カタログがあればresponses対応を確認 (失敗時はchat)
-		match client.list_models().await {
+		match session.list_models().await {
 			Ok(models) => {
 				let found = models.iter().find(|m| m.id == model);
 				llm::route_for_model(&model, found.and_then(|m| m.supported_endpoints.as_deref())).to_string()
@@ -387,111 +385,65 @@ async fn run_chat(
 			Err(_) => "chat/completions".to_string(),
 		}
 	};
+	let (route, max_tokens) = match wire.as_str() {
+		"messages" => (Route::Messages, Some(max_tokens.unwrap_or(1024))),
+		"responses" if !stream => (Route::Responses, max_tokens),
+		_ if stream => (Route::Stream, max_tokens),
+		_ => (Route::Chat, max_tokens),
+	};
 
-	if wire == "messages" {
-		let out = client
-			.messages_with_usage(&model, msgs, system.as_deref(), max_tokens.unwrap_or(1024))
-			.await?;
-		emit_output(
-			out.text,
-			out.thinking,
-			out.usage,
-			json_output,
-			show_usage,
-			false,
-			no_thinking,
-		);
-	} else if wire == "responses" && !stream {
-		let input = msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
-		let out = client.responses_with_usage(&model, &input).await?;
-		emit_output(
-			out.text,
-			out.thinking,
-			out.usage,
-			json_output,
-			show_usage,
-			false,
-			no_thinking,
-		);
-	} else if stream {
-		use std::sync::Arc;
-		use std::sync::atomic::{AtomicBool, Ordering};
-		let mut stdout = std::io::stdout();
-		// Thinking は本文とは別に stderr へ逐次出す。JSON時・--no-thinking時は抑止。
-		// 本文の最初のデルタが来たら思考ブロックを閉じる (thinking→text の順で読みやすく)。
-		let thinking_open = Arc::new(AtomicBool::new(false));
-		let thinking_closed = Arc::new(AtomicBool::new(false));
-		let thinking_open_delta = Arc::clone(&thinking_open);
-		let thinking_closed_delta = Arc::clone(&thinking_closed);
-		let mut on_delta = |d: &str| {
-			if json_output {
-				return;
-			}
-			if !no_thinking
-				&& thinking_open_delta.load(Ordering::SeqCst)
-				&& !thinking_closed_delta.load(Ordering::SeqCst)
-			{
-				eprintln!("\n--- end of thinking ---");
-				thinking_closed_delta.store(true, Ordering::SeqCst);
-			}
-			print!("{d}");
-			let _ = stdout.flush();
-		};
-		let thinking_open_th = Arc::clone(&thinking_open);
-		let thinking_closed_th = Arc::clone(&thinking_closed);
-		let mut on_thinking = |t: &str| {
-			if json_output || no_thinking {
-				return;
-			}
-			// 本文開始後に思考が来る稀な形ではブロックを再開する。
-			if thinking_closed_th.load(Ordering::SeqCst) {
-				thinking_closed_th.store(false, Ordering::SeqCst);
-			}
-			if !thinking_open_th.load(Ordering::SeqCst) {
-				eprintln!("--- thinking ---");
-				thinking_open_th.store(true, Ordering::SeqCst);
-			}
-			eprint!("{t}");
-			let _ = std::io::stderr().flush();
-		};
-		let out = client
-			.chat_stream_with_usage(&model, msgs, &mut on_delta, &mut on_thinking)
-			.await?;
-		let header_printed = thinking_open.load(Ordering::SeqCst);
-		let closed = thinking_closed.load(Ordering::SeqCst);
-		if header_printed && !closed && !json_output && !no_thinking {
-			eprintln!("\n--- end of thinking ---");
+	// ストリーム時のみ呼ばれる。Thinking は本文とは別に stderr へ逐次出す。JSON時・--no-thinking時は抑止。
+	// 本文の最初のデルタが来たら思考ブロックを閉じる (thinking→text の順で読みやすく)。
+	let thinking_open = AtomicBool::new(false);
+	let thinking_closed = AtomicBool::new(false);
+	let mut stdout = std::io::stdout();
+	let mut on_delta = |d: &str| {
+		if json_output {
+			return;
 		}
-		// 人間向け表示ではライブ表示済みのため再表示しない (Noneを渡す)。
-		// JSON時は結果に含める必要があるためそのまま渡す。
-		let thinking_for_output = if json_output {
-			out.thinking
-		} else if header_printed {
-			None
-		} else {
-			out.thinking
-		};
-		emit_output(
-			out.text,
-			thinking_for_output,
-			out.usage,
-			json_output,
-			show_usage,
-			!json_output,
-			no_thinking,
-		);
-	} else {
-		let out = client.chat_with_usage(&model, msgs, max_tokens).await?;
-		emit_output(
-			out.text,
-			out.thinking,
-			out.usage,
-			json_output,
-			show_usage,
-			false,
-			no_thinking,
-		);
+		if !no_thinking && thinking_open.load(Ordering::SeqCst) && !thinking_closed.load(Ordering::SeqCst) {
+			eprintln!("\n--- end of thinking ---");
+			thinking_closed.store(true, Ordering::SeqCst);
+		}
+		print!("{d}");
+		let _ = stdout.flush();
+	};
+	let mut on_thinking = |t: &str| {
+		if json_output || no_thinking {
+			return;
+		}
+		// 本文開始後に思考が来る稀な形ではブロックを再開する。
+		thinking_closed.store(false, Ordering::SeqCst);
+		if !thinking_open.swap(true, Ordering::SeqCst) {
+			eprintln!("--- thinking ---");
+		}
+		eprint!("{t}");
+		let _ = std::io::stderr().flush();
+	};
+	let out = session
+		.chat(route, &model, msgs, max_tokens, &mut on_delta, &mut on_thinking)
+		.await?;
+
+	let streamed = route == Route::Stream && !json_output;
+	let header_printed = thinking_open.load(Ordering::SeqCst);
+	if header_printed && !thinking_closed.load(Ordering::SeqCst) && !json_output && !no_thinking {
+		eprintln!("\n--- end of thinking ---");
 	}
+	// 人間向け表示ではライブ表示済みの思考は再表示しない。JSON時は結果に含める。
+	let thinking = if header_printed && !json_output {
+		None
+	} else {
+		out.thinking
+	};
+	emit_output(
+		out.text,
+		thinking,
+		out.usage,
+		json_output,
+		show_usage,
+		streamed,
+		no_thinking,
+	);
 	Ok(())
 }
 
@@ -566,16 +518,16 @@ fn format_usage(u: &llm::Usage) -> String {
 	)
 }
 
-/// Calls `client.quota()` and prints the result in a human-readable format or JSON.
-async fn run_quota(client: &dyn Provider, json: bool) -> Result<()> {
-	let quota = client.quota().await?;
+/// Calls `session.quota()` and prints the result in a human-readable format or JSON.
+async fn run_quota(session: &Session, json: bool) -> Result<()> {
+	let quota = session.quota().await?;
 
 	if json {
 		println!("{}", serde_json::to_string_pretty(&quota)?);
 		return Ok(());
 	}
 
-	println!("[{}] quota", client.name());
+	println!("[{}] quota", session.provider_name());
 	if let Some(plan) = &quota.plan {
 		let status = quota.status.as_deref().unwrap_or("-");
 		println!("plan: {plan} ({status})");

@@ -1,6 +1,7 @@
 //! LetsHarness の Client (GUI)。Claude 風のシンプルなチャット画面。
 //!
-//! CLI と同じく `Kernel::boot` で Kernel を動かし、返ってきた [`Host`] に Provider を頼むだけ。
+//! CLI と同じく `Kernel::boot` で Kernel を動かし、返ってきた [`Host`] に Session を頼むだけ。
+//! モデルは Session 経由で呼ぶので、Hook と Observer は CLI と同じように効く。
 //! 起動引数の `-o key=value` はそのまま Kernel とプロバイダに渡す。
 
 mod fonts;
@@ -17,7 +18,7 @@ use iced::widget::{
 use iced::{Center, Element, Fill, Length, Size, window};
 use iced_squircle::squircle;
 
-use letsharness_kernel::{BootConfig, ChatMessage, ChatOutput, Host, Kernel, Provider};
+use letsharness_kernel::{BootConfig, ChatMessage, ChatOutput, Host, Kernel, Route, Session};
 
 /// `messages` wire (Anthropic) で使う出力上限。
 const MAX_TOKENS: u32 = 4096;
@@ -145,7 +146,7 @@ struct App {
 	options: Vec<(String, String)>,
 	providers: Vec<String>,
 	provider: Option<String>,
-	client: Option<Arc<dyn Provider>>,
+	client: Option<Arc<Session>>,
 	models: Vec<String>,
 	model: Option<String>,
 	/// プロバイダ・モデル周りの問題 (認証不足など)。
@@ -167,7 +168,7 @@ enum Delta {
 enum Message {
 	Booted(Result<Arc<Host>, String>),
 	ProviderSelected(String),
-	ProviderReady(String, Result<(Arc<dyn Provider>, Vec<String>), String>),
+	ProviderReady(String, Result<(Arc<Session>, Vec<String>), String>),
 	ModelSelected(String),
 	Edit(text_editor::Action),
 	Send,
@@ -305,7 +306,7 @@ impl App {
 		Task::none()
 	}
 
-	/// プロバイダを作り、モデル一覧を引く。
+	/// Session (プロバイダ + ツール + Hook + Observer) を作り、モデル一覧を引く。
 	fn select_provider(&mut self, kind: String) -> Task<Message> {
 		let Boot::Ready(host) = &self.kernel else {
 			return Task::none();
@@ -320,9 +321,9 @@ impl App {
 		let request = kind.clone();
 		Task::perform(
 			async move {
-				let client = host.provider(&request, &cfg).await.map_err(|e| e.to_string())?;
-				let models = client.list_models().await.map_err(|e| e.to_string())?;
-				Ok((client, models.into_iter().map(|m| m.id).collect()))
+				let session = host.session(&request, &cfg).await.map_err(|e| e.to_string())?;
+				let models = session.list_models().await.map_err(|e| e.to_string())?;
+				Ok((Arc::new(session), models.into_iter().map(|m| m.id).collect()))
 			},
 			move |r| Message::ProviderReady(kind.clone(), r),
 		)
@@ -610,12 +611,14 @@ fn options_cfg(options: &[(String, String)]) -> serde_json::Value {
 /// 1ターン分の応答。差分は [`Message::Delta`]、最後に全文を [`Message::Finished`] で返す。
 ///
 /// `claude-*` は CLI と同じく `messages` wire (非ストリーム)、それ以外は `chat/completions` のストリーム。
-fn respond(client: Arc<dyn Provider>, model: String, history: Vec<ChatMessage>, id: u64) -> Task<Message> {
+fn respond(client: Arc<Session>, model: String, history: Vec<ChatMessage>, id: u64) -> Task<Message> {
 	let (tx, rx) = mpsc::unbounded();
 	let work = async move {
-		if model.starts_with("claude-") {
-			return client.messages_with_usage(&model, history, None, MAX_TOKENS).await;
-		}
+		let (route, max_tokens) = if model.starts_with("claude-") {
+			(Route::Messages, Some(MAX_TOKENS))
+		} else {
+			(Route::Stream, None)
+		};
 		let thinking_tx = tx.clone();
 		let mut on_delta = move |d: &str| {
 			let _ = tx.unbounded_send(Delta::Text(d.to_owned()));
@@ -624,7 +627,7 @@ fn respond(client: Arc<dyn Provider>, model: String, history: Vec<ChatMessage>, 
 			let _ = thinking_tx.unbounded_send(Delta::Thinking(t.to_owned()));
 		};
 		client
-			.chat_stream_with_usage(&model, history, &mut on_delta, &mut on_thinking)
+			.chat(route, &model, history, max_tokens, &mut on_delta, &mut on_thinking)
 			.await
 	};
 	Task::batch([

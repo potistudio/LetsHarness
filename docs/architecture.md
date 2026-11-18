@@ -2,7 +2,7 @@
 
 LetsHarness は「可能な限りすべてをプラグインにする」マイクロカーネル構成を取る。
 kernel は「プラグインを発見して使う」ことだけを持ち、プロバイダ・ツール・エージェント・`.env` 読み込みなどはすべて別プロセスのプラグインとして載る。
-`letsharness` は Client で、kernel を動かして `Host` に頼むだけ。モデルとツールでループを回すのは kernel の責務 (`run_loop`) で、Agent とは呼ばない。どのプラグインがあるかは Client も kernel の実装も知らず、実行時に発見される。
+`letsharness` は Client で、kernel を動かして `Host` に頼み、モデルは `Host` が作る `Session` 経由で使うだけ。モデルとツールでループを回すのは kernel の責務 (`run_loop`) で、Agent とは呼ばない。どのプラグインがあるかは Client も kernel の実装も知らず、実行時に発見される。
 
 - 全体図: [Diagrams / Plugin architecture](#plugin-architecture)
 - Provider 拡張点とデータ設計: [Diagrams / Provider](#provider)
@@ -11,7 +11,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 
 | Layer | 役割 | 依存してよいもの |
 | --- | --- | --- |
-| `kernel` | プラグインの発見・起動・通信 (`Kernel::boot` → `Host`)、ループ (`run_loop`)、共有型、拡張点 trait、プラグイン側の `PluginServer` | serde, tokio, toml (UI・HTTP ライブラリには依存しない) |
+| `kernel` | プラグインの発見・起動・通信 (`Kernel::boot` → `Host`)、`Session`、ループ (`run_loop`)、共有型、拡張点 trait、プラグイン側の `PluginServer` | serde, tokio, toml (UI・HTTP ライブラリには依存しない) |
 | `letsharness` (Client) | CLI。`Kernel::boot` で kernel を動かし、`Host` に `kind` 名で頼む | **kernel のみ** (+ clap 等) |
 | `provider-*` | 各社 API の実装。`bin` + `plugin.toml` | kernel (+ reqwest 等) |
 | `agent-*` | 外部エージェント (自分でループもツールも持つもの) を `AgentBackend` として包む。`bin` + `plugin.toml` (例: `agent-antigravity`) | kernel (+ tokio::process 等) |
@@ -28,7 +28,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 1. **Client は kernel を動かすだけ。** プラグインの列挙もリンクもしない。`Kernel::boot(BootConfig)` が実行時にプラグインを発見し、Client は返ってきた `Host` を使う。kernel 単体でもプラグイン0個で起動する。
 2. **拡張点は kernel が決め打ちしない。** プラグインは manifest の `contributes` に文字列 ID (`provider` / `agent` / `tool` / `hook` / `observer` / `boot`) で宣言し、kernel はそれを `dyn Provider` / `dyn AgentBackend` / `dyn Tool` / `dyn Hook` / `dyn Observer` として見せる Adapter を持つ。新しい拡張点は新しい `contributes` キーとメッセージで足す。
 3. **プラグインを使うのは kernel。** Client も広義のプラグインと同じ立場で、`Host` 経由でしかプラグインに触れない。プラグイン同士も互いを知らない。起動前の処理 (`.env` など) は `boot` で環境変数を返す形にし、kernel 自身の環境は書き換えない。
-4. **Client は Provider を直接呼ばない。** 必ず `Host` (将来は `Session`) を経由し、hook と tool がどの Client からでも同じように効くようにする。
+4. **Client は Provider を直接呼ばない。** 必ず `Host::session` が作る `Session` を経由し、Hook と Observer がどの Client からでも同じように効くようにする。`Host` は Provider・ツール・Hook を単体では渡さない。
 5. **モデルとエージェントを分ける。** 分ける軸は認証方式 (APIキー / CLI のログイン) ではなく「エージェントループを誰が回すか」。1回の呼び出しがモデル1回で、ツール・履歴をこちらが持つものは `Provider`。ループ・ツール・会話履歴を相手が持つもの (Antigravity CLI など) は `AgentBackend`。CLI の保存済み認証情報で API を直接叩くなら、それは `Provider`。
 6. **Provider の `chat` は1本。** wire（chat/completions, responses, messages）の選択は各 Provider の内部事情。戻り値は `BoxStream<ChatEvent>` で、非ストリームは collect するだけ。
 7. **kernel の型はプロセス境界を越えられる形にする。** 独自拡張は `extra: serde_json::Value` のみとし、`as_any()` のような境界を越えないものは使わない。エラーは `Unsupported` / `Config` / `Api` / `Plugin { source }` に限定し、特定実装の型を持ち込まない。
@@ -40,11 +40,11 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 
 | 拡張点 | プラグインが実装する trait | Client から見える形 | 用途 |
 | --- | --- | --- | --- |
-| `provider` | `ProviderFactory` → `Provider` | `Host::provider(kind, cfg)` → `Arc<dyn Provider>` | LLM API。`create(cfg: Value)` でインスタンス化 |
+| `provider` | `ProviderFactory` → `Provider` | `Host::session(kind, cfg)` の中 | LLM API。`create(cfg: Value)` でインスタンス化 |
 | `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | ループもツールも自分で持って最終回答まで自走する外部エージェント。途中経過はプロセス間で通知として流れる |
-| `tool` | `ToolFactory` → `Tool` | `Host::tools(cfg)` → `ToolRegistry` | エージェントが呼ぶツール。スキーマは MCP と同形 |
-| `hook` | `HookFactory` → `Hook` | `Host::hooks(cfg, tools)` → `HookRegistry` | ループに割り込む。モデル呼び出しとツール実行の前後で、リクエスト・応答・ツール呼び出し・結果を書き換えたり止めたりする |
-| `observer` | `ObserverFactory` → `Observer` | `Host::observers(cfg)` (`HookRegistry::observe` で登録) | ループの出来事 (`Event`) を見るだけ。書き換えも停止もできず、ループは待たない |
+| `tool` | `ToolFactory` → `Tool` | `Session` に全部入る | エージェントが呼ぶツール。スキーマは MCP と同形 |
+| `hook` | `HookFactory` → `Hook` | `Session` に全部入る (並びは発見順) | ループに割り込む。モデル呼び出しとツール実行の前後で、リクエスト・応答・ツール呼び出し・結果を書き換えたり止めたりする |
+| `observer` | `ObserverFactory` → `Observer` | `Session` に全部入る | ループの出来事 (`Event`) を見るだけ。書き換えも停止もできず、ループは待たない |
 | `boot` | `BootHook` | (Kernel が起動時に呼ぶ) | 返した環境変数が、以降に起動するプラグインの環境に足される |
 
 ### Hook
@@ -74,10 +74,20 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 - 送れなかった出来事は警告して捨てる。見るだけの口なのでループは止めない。
 - `create` が `None` を返せば (設定が無いなど)、出来事は送られない。例: `observer-log` は `-o event_log=PATH` のときだけ JSON Lines で追記する。
 
+## Session
+
+`Host::session(kind, cfg)` が Provider・ツール・Hook・Observer をひとまとめにした `Session` を作る。Client がモデルを使う窓口はこれだけ (CLI の `models` / `chat` / `quota` / `loop` も GUI も)。
+
+- `Session::chat(route, model, messages, max_tokens, on_delta, on_thinking)`: ツールを使わない1回の呼び出し。`before_request` / `after_response` の Hook を通し、Observer に知らせる。`route` (`Chat` / `Stream` / `Responses` / `Messages`) は Provider のどの呼び方を使うか。ストリームの差分は Hook を通す前の本文で、Hook の書き換えは戻り値にだけ効く。
+- `Session::run_loop(req, handler)`: ツールを使いながら最終回答まで (下の Loop)。
+- どちらも返る前に Observer を flush する。
+- ツールは Hook より先に作り、その一覧を Hook の `create` に渡す。
+- 会話の履歴は今のところ Client が持ち、呼び出しごとに渡す。
+
 ## Provider / Loop / Agent
 
 - **Provider**: モデルを1回呼ぶだけ。履歴もツール実行も持たない。
-- **Loop**: モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答まで繰り返す。**kernel の責務** (`run_loop`、`Host::run_loop`)。使う `Provider` と `Tool` は `Host` が引いたもので、どのプラグインのものかは知らない。途中経過は `RunHandler` で Client に委ねる。ツールは承認なしで実行される (`bash` は cwd を決めるだけで何でも実行できるので、信頼できない入力には使わない)。
+- **Loop**: モデル呼び出し → ツール実行 → 結果を返して再呼び出し、を最終回答まで繰り返す。**kernel の責務** (`run_loop`、`Session::run_loop`)。使う `Provider` と `Tool` は `Host` が引いたもので、どのプラグインのものかは知らない。途中経過は `RunHandler` で Client に委ねる。ツールは承認なしで実行される (`bash` は cwd を決めるだけで何でも実行できるので、信頼できない入力には使わない)。
 - **Agent**: ループもツールも相手が持っていて、こちらは依頼を渡して結果と途中経過を受け取るだけのもの (Antigravity CLI など)。`AgentBackend` の拡張点。
 
 Loop は Agent ではないので、プラグインにはしない。Client は `loop` (Loop) と `agent` (外部エージェント。`--backend` で kind を選ぶ) を別のコマンドとして持つ。
@@ -146,7 +156,7 @@ path = "~/.letsharness/plugins/openai-compat"
 
 1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。設定ファイル (`default_provider` / `[providers.x]`) を導入する。いまの `Provider` は多数のメソッドを持ち、そのまま線の上を流れている。
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
-3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` (Client が直接 `chat` するときにも Hook を効かせる) は未着手。
+3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` も実装済みで、`chat` / GUI にも Hook と Observer が効く。会話の履歴を `Session` に持たせるのは未着手。
 4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) は実装済み。
 5. プラグインの配布 (`plugins/` への導入手順、`cargo xtask install` 相当)。
 6. 必要になったら TUI / Server の Client、C ABI / WASM transport。
@@ -175,12 +185,15 @@ classDiagram
     +plugin_path: Vec~PathBuf~
   }
   class Host {
-    +provider(kind, cfg) Arc~dyn Provider~
+    +session(kind, cfg) Session
     +agent_backend(kind, cfg) Arc~dyn AgentBackend~
-    +tools(cfg) ToolRegistry
-    +hooks(cfg) HookRegistry
-    +run_loop(provider, cfg, req, handler) LoopOutcome
     +has_agent_backend(kind) bool
+  }
+  class Session {
+    +chat(route, model, messages, max_tokens, on_delta, on_thinking) ChatOutput
+    +run_loop(req, handler) LoopOutcome
+    +list_models() Vec~ModelInfo~
+    +quota() Quota
   }
   class Manifest {
     +name
@@ -270,6 +283,8 @@ classDiagram
 
   Client ..> Kernel : boot
   Client ..> Host : 頼む
+  Client ..> Session : モデルを使う
+  Host ..> Session : 作る
   Kernel ..> BootConfig
   Kernel ..> Manifest : 発見 (*/plugin.toml)
   Kernel --> Host : 返す
@@ -283,6 +298,7 @@ classDiagram
   Tool <|.. RemoteTool
   Hook <|.. RemoteHook
   Observer <|.. RemoteObserver
+  Session o-- RemoteProvider
   Host ..> RemoteProvider : create
   Host ..> RemoteAgent : create
   Host ..> RemoteTool : create
