@@ -7,8 +7,8 @@
 //! - 非ストリーム : `POST /models/{model}:generateContent`
 //! - ストリーム   : `POST /models/{model}:streamGenerateContent?alt=sse`
 //!
-//! Gemini には chat/completions・responses・messages の区別が無いため、
-//! [`Provider`] のどの wire 系メソッドも `generateContent` に寄せる。
+//! Gemini には chat/completions・responses・messages の区別が無い。[`Provider::chat`] はツールが無ければ
+//! ストリーム、ツールがあれば非ストリームの `generateContent` を使う。
 //! アカウント単位の残量を返す API は無いので [`Provider::quota`] は未対応 (既定実装)。
 //!
 //! 思考過程は `thinkingConfig.includeThoughts` で要約を受け取る (思考対応モデルのみ)。
@@ -23,7 +23,10 @@ mod wire;
 
 use futures_util::StreamExt;
 
-use letsharness_kernel::{ChatMessage, ChatOutput, Completion, Error, ModelInfo, Provider, Result, ToolSpec};
+use letsharness_kernel::{
+	ChatMessage, ChatRequest, ChatSink, ChatStream, Completion, Error, ModelInfo, Provider, Result, ToolSpec,
+	chat_stream,
+};
 
 const PLUGIN: &str = "gemini";
 
@@ -196,47 +199,30 @@ impl Provider for GeminiProvider {
 		}
 	}
 
-	async fn chat(&self, model: &str, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<String> {
-		Ok(self.chat_with_usage(model, messages, max_tokens).await?.text)
-	}
-
-	async fn chat_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		max_tokens: Option<u32>,
-	) -> Result<ChatOutput> {
-		let c = self.generate(model, &messages, &[], max_tokens).await?;
-		Ok(ChatOutput {
-			text: c.text,
-			thinking: c.thinking,
-			usage: c.usage,
+	fn chat<'a>(&'a self, model: &'a str, req: ChatRequest) -> ChatStream<'a> {
+		chat_stream(move |sink| async move {
+			if req.tools.is_empty() {
+				return self.stream(model, &req.messages, req.max_tokens, &sink).await;
+			}
+			let completion = self.generate(model, &req.messages, &req.tools, req.max_tokens).await?;
+			sink.thinking(completion.thinking.as_deref().unwrap_or_default());
+			sink.text(&completion.text);
+			Ok(completion)
 		})
 	}
+}
 
-	async fn chat_stream(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<String> {
-		Ok(self
-			.chat_stream_with_usage(model, messages, on_delta, on_thinking)
-			.await?
-			.text)
-	}
-
+impl GeminiProvider {
 	// -- POST :streamGenerateContent?alt=sse -----------------------------------
-	async fn chat_stream_with_usage(
+	async fn stream(
 		&self,
 		model: &str,
-		messages: Vec<ChatMessage>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<ChatOutput> {
+		messages: &[ChatMessage],
+		max_tokens: Option<u32>,
+		sink: &ChatSink,
+	) -> Result<Completion> {
 		let started = std::time::Instant::now();
-		let body = wire::build_body(model, &messages, &[], None, self.include_thoughts);
+		let body = wire::build_body(model, messages, &[], max_tokens, self.include_thoughts);
 		let res = self
 			.auth(
 				self.http_client
@@ -281,11 +267,11 @@ impl Provider for GeminiProvider {
 					}
 					if !p.thinking.is_empty() {
 						thinking.push_str(&p.thinking);
-						on_thinking(&p.thinking);
+						sink.thinking(&p.thinking);
 					}
 					if !p.text.is_empty() {
 						full.push_str(&p.text);
-						on_delta(&p.text);
+						sink.text(&p.text);
 					}
 				}
 			}
@@ -299,59 +285,12 @@ impl Provider for GeminiProvider {
 			u.latency_ms = Some(started.elapsed().as_millis() as u64);
 			u.ttft_ms = ttft_ms;
 		}
-		Ok(ChatOutput {
+		Ok(Completion {
 			text: full,
-			thinking: ChatOutput::normalized_thinking(Some(thinking)),
+			thinking: Completion::normalized_thinking(Some(thinking)),
+			tool_calls: Vec::new(),
 			usage,
 		})
-	}
-
-	async fn chat_with_tools(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		tools: &[ToolSpec],
-		max_tokens: Option<u32>,
-	) -> Result<Completion> {
-		self.generate(model, &messages, tools, max_tokens).await
-	}
-
-	// Gemini に Responses / Messages の区別は無いので generateContent に寄せる。
-	async fn responses(&self, model: &str, input: &str) -> Result<String> {
-		Ok(self.responses_with_usage(model, input).await?.text)
-	}
-
-	async fn responses_with_usage(&self, model: &str, input: &str) -> Result<ChatOutput> {
-		self.chat_with_usage(model, vec![ChatMessage::user(input)], None).await
-	}
-
-	async fn messages(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<String> {
-		Ok(self
-			.messages_with_usage(model, messages, system, max_tokens)
-			.await?
-			.text)
-	}
-
-	async fn messages_with_usage(
-		&self,
-		model: &str,
-		mut messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<ChatOutput> {
-		// 呼び出し側が system を messages にも入れている場合は二重にしない。
-		if let Some(s) = system
-			&& !messages.iter().any(|m| m.role == "system")
-		{
-			messages.insert(0, ChatMessage::system(s));
-		}
-		self.chat_with_usage(model, messages, Some(max_tokens)).await
 	}
 }
 

@@ -50,6 +50,7 @@ fn letsharness_in(home: &std::path::Path, args: &[&str]) -> Output {
 		.env("LETSHARNESS_PLUGIN_PATH", plugin_dir())
 		.env("LETSHARNESS_HOME", home)
 		.env_remove("LETSHARNESS_PROFILE")
+		.env_remove("LETSHARNESS_CONFIG")
 		.current_dir(std::env::temp_dir())
 		.output()
 		.expect("run letsharness")
@@ -361,6 +362,66 @@ fn patch_layers_configure_plugins() {
 	assert!(!out.status.success());
 	assert!(stderr(&out).contains("unknown plugin `nope`"), "{}", stderr(&out));
 	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 設定ファイルの `[providers.NAME]` は名前付きのインスタンスで、`default_provider` は `--provider` の既定になる。
+#[test]
+fn the_config_file_names_providers() {
+	let home = std::env::temp_dir().join(format!("lh-e2e-config-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&home);
+	std::fs::create_dir_all(&home).unwrap();
+	std::fs::write(
+		home.join("config.toml"),
+		"default_provider = \"echo\"\n[providers.echo]\nkind = \"mock\"\nprefix = \"cfg> \"\n[providers.bad]\nkind = \"nope\"\n",
+	)
+	.unwrap();
+	let chat = |extra: &[&str]| {
+		letsharness_in(
+			&home,
+			&[&["chat", "--model", "m", "--prompt", "hi"][..], extra].concat(),
+		)
+	};
+
+	let out = chat(&[]);
+	assert!(out.status.success(), "{}", stderr(&out));
+	assert_eq!(stdout(&out).trim(), "cfg> m: hi");
+	// -o は設定ファイルより強い
+	let out = chat(&["-o", "prefix=cli> "]);
+	assert_eq!(stdout(&out).trim(), "cli> m: hi");
+	// 表に無い名前は kind
+	let out = chat(&["--provider", "mock"]);
+	assert_eq!(stdout(&out).trim(), "[mock] m: hi");
+	// 再開はログに残った名前で、設定ファイルの表をまた使う
+	let id = stderr(&chat(&[]))
+		.lines()
+		.find_map(|l| l.strip_prefix("session: "))
+		.and_then(|l| l.split_whitespace().next())
+		.expect("session id")
+		.to_owned();
+	let out = chat(&["--resume", &id]);
+	assert_eq!(stdout(&out).trim(), "cfg> m: hi");
+
+	let out = chat(&["--provider", "bad"]);
+	assert!(!out.status.success());
+	assert!(
+		stderr(&out).contains("providers.bad: unknown kind: nope"),
+		"{}",
+		stderr(&out)
+	);
+	let out = chat(&["--provider", "nope"]);
+	assert!(
+		stderr(&out).contains("unknown provider: nope (bad|echo|"),
+		"{}",
+		stderr(&out)
+	);
+	let out = chat(&["--config", home.join("missing.toml").to_str().unwrap()]);
+	assert!(stderr(&out).contains("ファイルがありません"), "{}", stderr(&out));
+
+	std::fs::write(home.join("config.toml"), "default_providr = \"x\"\n").unwrap();
+	let out = chat(&[]);
+	assert!(!out.status.success());
+	assert!(stderr(&out).contains("unknown field"), "{}", stderr(&out));
+	std::fs::remove_dir_all(&home).unwrap();
 }
 
 /// 会話はセッションログに残り、`--resume` で前のターンを含めて続けられる。

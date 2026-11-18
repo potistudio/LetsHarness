@@ -13,16 +13,27 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::dispatch::{call_provider, field, to_value};
 use crate::rpc::{Frame, WireError};
 use crate::{
-	AgentBackend, AgentRequest, Completion, Error, Event, Hook, ModelRequest, Observer, Provider, Result, RunHandler,
-	Tool, ToolCall, ToolOutput, ToolSpec,
+	AgentBackend, AgentRequest, ChatEvent, ChatRequest, Completion, Error, Event, Hook, ModelRequest, Observer,
+	Provider, Result, RunHandler, Tool, ToolCall, ToolOutput, ToolSpec,
 };
+
+/// `params[key]` を型に直す。無ければ `null` として扱う (`Option` なら `None`)。
+fn field<T: DeserializeOwned>(params: &Value, key: &str) -> Result<T> {
+	serde_json::from_value(params.get(key).cloned().unwrap_or(Value::Null))
+		.map_err(|e| Error::Config(format!("bad params `{key}`: {e}")))
+}
+
+fn to_value<T: serde::Serialize>(v: T) -> Result<Value> {
+	serde_json::to_value(v).map_err(|e| Error::plugin("kernel", e))
+}
 
 // ---------------------------------------------------------------------------
 // プラグインが実装する拡張点
@@ -265,11 +276,28 @@ impl Inner {
 					.get(&instance)
 					.cloned()
 					.ok_or_else(|| Error::Config(format!("unknown provider instance: {instance}")))?;
-				let method = &m["provider.".len()..];
-				// ストリームの差分は、呼び出しの最中に通知として流す。
-				let mut delta = |text: &str| self.notify("stream.delta", req, json!({ "text": text }));
-				let mut thinking = |text: &str| self.notify("stream.thinking", req, json!({ "text": text }));
-				call_provider(&*provider, method, &params, &mut delta, &mut thinking).await
+				match &m["provider.".len()..] {
+					"list_models" => to_value(provider.list_models().await?),
+					"quota" => to_value(provider.quota().await?),
+					// 応答の差分は、呼び出しの最中に通知として流す。
+					"chat" => {
+						let model: String = field(&params, "model")?;
+						let mut stream = provider.chat(&model, field::<ChatRequest>(&params, "request")?);
+						while let Some(event) = stream.next().await {
+							match event? {
+								ChatEvent::TextDelta { text } => {
+									self.notify("stream.delta", req, json!({ "text": text }))
+								}
+								ChatEvent::ThinkingDelta { text } => {
+									self.notify("stream.thinking", req, json!({ "text": text }))
+								}
+								ChatEvent::Done { completion } => return to_value(completion),
+							}
+						}
+						Err(Error::plugin("kernel", "応答が `done` の前に終わりました"))
+					}
+					other => Err(Error::Unsupported(format!("provider.{other}"))),
+				}
 			}
 			"agent.create" => {
 				let kind: String = field(&params, "kind")?;

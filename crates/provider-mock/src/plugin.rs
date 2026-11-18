@@ -38,8 +38,10 @@ mod tests {
 	#[tokio::test]
 	async fn factory_applies_cfg() {
 		let chat = |p: Arc<dyn Provider>| async move {
-			p.chat("m", vec![letsharness_kernel::ChatMessage::user("hi")], None)
+			let req = letsharness_kernel::ChatRequest::new(vec![letsharness_kernel::ChatMessage::user("hi")]);
+			letsharness_kernel::collect(p.chat("m", req), &mut |_| {}, &mut |_| {})
 				.await
+				.map(|c| c.text)
 				.map_err(|e| e.to_string())
 		};
 		let f = MockFactory;

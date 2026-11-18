@@ -30,7 +30,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 3. **プラグインを使うのは kernel。** Client も広義のプラグインと同じ立場で、`Host` 経由でしかプラグインに触れない。プラグイン同士も互いを知らない。起動前の処理 (`.env` など) は `boot` で環境変数を返す形にし、kernel 自身の環境は書き換えない。
 4. **Client は Provider を直接呼ばない。** 必ず `Host::session` が作る `Session` を経由し、Hook と Observer がどの Client からでも同じように効くようにする。`Host` は Provider・ツール・Hook を単体では渡さない。
 5. **モデルとエージェントを分ける。** 分ける軸は認証方式 (APIキー / CLI のログイン) ではなく「エージェントループを誰が回すか」。1回の呼び出しがモデル1回で、ツール・履歴をこちらが持つものは `Provider`。ループ・ツール・会話履歴を相手が持つもの (Antigravity CLI など) は `AgentBackend`。CLI の保存済み認証情報で API を直接叩くなら、それは `Provider`。
-6. **Provider の `chat` は1本。** wire（chat/completions, responses, messages）の選択は各 Provider の内部事情。戻り値は `BoxStream<ChatEvent>` で、非ストリームは collect するだけ。
+6. **Provider の `chat` は1本。** `Provider` は `list_models` / `chat(model, ChatRequest) -> ChatStream` / `quota` だけを持つ。wire（chat/completions, responses, messages）の選択とストリームで受けるかどうかは各 Provider の内部事情。戻り値は `ChatEvent` (`text_delta` / `thinking_delta` / 最後に `done`) の流れで、一括で欲しい側は `collect` するだけ。
 7. **kernel の型はプロセス境界を越えられる形にする。** 独自拡張は `extra: serde_json::Value` のみとし、`as_any()` のような境界を越えないものは使わない。エラーは `Unsupported` / `Config` / `Api` / `Plugin { source }` に限定し、特定実装の型を持ち込まない。
 8. **プロバイダは「種類 (kind)」と「インスタンス」を分ける。** 同じ kind をキーや設定を変えて複数インスタンス化できる。設定ファイルが無い場合は kind と同名のインスタンスを暗黙に作る。
 
@@ -40,7 +40,7 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 
 | 拡張点 | プラグインが実装する trait | Client から見える形 | 用途 |
 | --- | --- | --- | --- |
-| `provider` | `ProviderFactory` → `Provider` | `Host::session(kind, cfg)` の中 | LLM API。`create(cfg: Value)` でインスタンス化 |
+| `provider` | `ProviderFactory` → `Provider` | `Host::session(provider, cfg)` の中 | LLM API。`create(cfg: Value)` でインスタンス化 |
 | `agent` | `AgentBackendFactory` → `AgentBackend` | `Host::agent_backend(kind, cfg)` | ループもツールも自分で持って最終回答まで自走する外部エージェント。途中経過はプロセス間で通知として流れる |
 | `tool` | `ToolFactory` → `Tool` | `Session` に全部入る | エージェントが呼ぶツール。スキーマは MCP と同形 |
 | `hook` | `HookFactory` → `Hook` | `Session` に全部入る (並びは発見順) | ループに割り込む。モデル呼び出しとツール実行の前後で、リクエスト・応答・ツール呼び出し・結果を書き換えたり止めたりする |
@@ -76,9 +76,9 @@ kernel は「プラグインを発見して使う」ことだけを持ち、プ�
 
 ## Session
 
-`Host::session(kind, cfg)` が Provider・ツール・Hook・Observer をひとまとめにした `Session` を作る。Client がモデルを使う窓口はこれだけ (CLI の `models` / `chat` / `quota` / `loop` も GUI も)。1つの `Session` が1つの会話で、会話の履歴は `Session` が持つ。Client は毎ターンの新しいメッセージだけを渡す。
+`Host::session(provider, cfg)` (`provider` は設定ファイルのインスタンス名か kind) が Provider・ツール・Hook・Observer をひとまとめにした `Session` を作る。Client がモデルを使う窓口はこれだけ (CLI の `models` / `chat` / `quota` / `loop` も GUI も)。1つの `Session` が1つの会話で、会話の履歴は `Session` が持つ。Client は毎ターンの新しいメッセージだけを渡す。
 
-- `Session::chat(route, model, input, max_tokens, on_delta, on_thinking)`: ツールを使わない1回の呼び出し。`input` を履歴に続けて送る。`before_request` / `after_response` の Hook を通し、Observer に知らせる。`route` (`Chat` / `Stream` / `Responses` / `Messages`) は Provider のどの呼び方を使うか。ストリームの差分は Hook を通す前の本文で、Hook の書き換えは戻り値にだけ効く。
+- `Session::chat(model, req) -> ChatStream`: ツールを使わない1回の呼び出し。`req.messages` (このターンの新しいメッセージ) を履歴に続けて送る。`before_request` / `after_response` の Hook を通し、Observer に知らせる。差分 (`text_delta` / `thinking_delta`) は Hook を通す前の本文で、最後の `done` が Hook を通した応答。`req.tools` が空でなければ `Err(Config)`。ストリームを途中で捨てるとターンはそこで止まる。
 - `Session::run_loop(req, handler)`: ツールを使いながら最終回答まで (下の Loop)。`req.messages` はこのターンの新しいメッセージ。
 - 成功したターンだけが履歴に加わる (ループは途中のツール往復ごと)。失敗・中断したターンは履歴に残らない。同じ `Session` のターンは1つずつ進む。
 - `before_request` の書き換えはリクエストにだけ効き、履歴には入らない。`after_response` の書き換えは履歴に入る。
@@ -154,27 +154,32 @@ disabled = true
 - `letsharness plugin list` で層を重ねた結果を、`plugin enable <id>` / `plugin disable <id>` で profile のパッチを書き換える (プラグインは起動しない)。既定 (有効) に戻すと行は消え、profile には既定との差分だけが残る。書き戻すときコメントは残らない。
 - GUI は `$LETSHARNESS_PROFILE` の profile を使う。
 
-`.env` は `crates/plugin-dotenv` が `boot` で読み、未設定の環境変数だけを返す（`.env < 環境変数`）。kernel はそれを以降に起動するプラグインの環境に足す。カレントから親へ遡って探し、`-o env_file=<PATH>` で指定、`-o no_env_file=true` で無効化できる。
+### 設定ファイル
 
-プラグイン固有の設定は専用フラグを持たず、`-o key=value` で渡す (`boot` を持つプラグインと、選択中のインスタンスに届く)。例: mock の `-o prefix=">> "` / `-o error=boom`。
+`<home>/config.toml` (`$LETSHARNESS_CONFIG` か `--config FILE` で変えられる。既定の場所に無ければ空の設定) で、Provider に名前を付けて既定を決める。
 
 ```toml
-frontend = "cli"
-default_provider = "cc"
+default_provider = "work"     # --provider を省いたときの名前 (無ければ CLI は commandcode)
 
-[providers.cc]
-kind = "commandcode"
-zdr  = true
+[providers.work]
+kind = "commandcode"          # 省略すると表の名前を kind とみなす
+wire = "messages"             # kind 以外はそのまま Provider の cfg に渡る
 
 [providers.echo]
 kind   = "mock"
 prefix = ">> "
-
-[[plugins]]   # 外部プラグイン
-path = "~/.letsharness/plugins/openai-compat"
 ```
 
-プロバイダ固有の設定は CLI フラグとしては定義しない。`-o key=value` で選択中のインスタンスの設定を上書きする。
+- `--provider` にはインスタンス名か kind を渡す。表に無い名前は kind とみなし、cfg は空。同じ kind で複数のインスタンスを持てる。
+- Provider の cfg は「パッチ層のプラグイン設定 → 設定ファイルの表 → `-o key=value`」の順に上書きされる。
+- セッションログにはこの名前が残り、`--resume` は設定ファイルの表をまた引く。
+- 未知のトップレベルのキーは起動を止める。インスタンスの kind が無いことは、そのインスタンスを使うときにエラーになる。
+- GUI のプロバイダ一覧は `Host::provider_names` (インスタンス名 → それ以外の kind) で、初期値は `default_provider`。
+
+`.env` は `crates/plugin-dotenv` が `boot` で読み、未設定の環境変数だけを返す（`.env < 環境変数`）。kernel はそれを以降に起動するプラグインの環境に足す。カレントから親へ遡って探し、`-o env_file=<PATH>` で指定、`-o no_env_file=true` で無効化できる。
+
+プラグイン固有の設定は専用フラグを持たず、`-o key=value` で渡す (`boot` を持つプラグインと、選択中のインスタンスに届く)。例: mock の `-o prefix=">> "` / `-o error=boom`、commandcode の `-o wire=messages`。
+プロバイダ固有の設定は CLI フラグとしては定義しない。例外は `chat --route` で、リクエストの `extra.wire` になる (commandcode が使い、他は無視する)。
 
 ## External plugins
 
@@ -183,15 +188,16 @@ path = "~/.letsharness/plugins/openai-compat"
   - リクエスト `{id, method, params}` → 応答 `{id, result}` / `{id, error: {kind, message, ...}}`。向きは kernel → プラグインのみ (通知は両方向)。
   - ストリームやエージェントの途中経過は、`params.req` に元リクエストの id を入れた通知で流す。
   - 型の後方互換は保証しない。プラグインと kernel は同じバージョンでビルドする。
-  - kernel → プラグイン: `boot` / `provider.create` / `provider.<Provider の各メソッド>` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call` / `hook.create` / `hook.before_request` / `hook.on_tool_call` / `hook.after_response` / `hook.after_tool_call` / `observer.create` / `observer.flush`。
+  - kernel → プラグイン: `boot` / `provider.create` / `provider.list_models` / `provider.chat` / `provider.quota` / `agent.create` / `agent.list_models` / `agent.run` / `tool.create` / `tool.call` / `hook.create` / `hook.before_request` / `hook.on_tool_call` / `hook.after_response` / `hook.after_tool_call` / `observer.create` / `observer.flush`。
   - kernel → プラグインの通知: `observer.event` (応答なし)。
+  - プラグイン → kernel の通知: `stream.delta` / `stream.thinking` (`provider.chat` の差分。応答は `Completion`) と `agent.on_*`。
 - プラグインは使われるときに初めて起動し、以降は同じプロセスを使う。
 - 運ぶ手段は差し替え可能な設計のまま。高頻度呼び出しや C/C++/Zig 製が必要になれば C ABI、サンドボックスが必要になれば WASM component model を検討する。
 - Tool は MCP クライアントを実装し、既存の MCP サーバーをそのまま `dyn Tool` として使う (未着手)。Provider には MCP 相当の標準がないため独自プロトコル。
 
 ## Roadmap
 
-1. `Provider` trait を `chat(model, req) -> BoxStream<ChatEvent>` 1本に作り直し、wire 選択を各プロバイダへ移す。設定ファイル (`default_provider` / `[providers.x]`) を導入する。いまの `Provider` は多数のメソッドを持ち、そのまま線の上を流れている。
+1. **完了**: `Provider` trait を `chat(model, req) -> ChatStream` 1本に作り直し、wire 選択を各プロバイダへ移した (commandcode は `Wire::for_model`、`wire` で決め打ち)。設定ファイル (`default_provider` / `[providers.x]`) を導入した。
 2. **完了**: kernel が外部プラグインを発見・起動・通信する (`Kernel::boot` / `Host` / `PluginServer`)。Client は `crates/letsharness` で kernel のみに依存する。
 3. `Session` を挟み、`Hook` (before_request / on_tool_call / after_response / after_tool_call) を効かせる。`Hook` 拡張点と `run_loop` への適用は実装済み (`crates/hook-guard`)。`Session` も実装済みで、`chat` / GUI にも Hook と Observer が効く。会話の履歴は `Session` が持ち、セッションログから `--resume` で再開できる。
 4. MCP クライアント。`Tool` / `ToolRegistry`、ローカルツール (`crates/tool-local`)、kernel のループ (`run_loop`、`letsharness loop`)、外部エージェント `crates/agent-antigravity` (`letsharness agent --backend antigravity`) は実装済み。
@@ -231,7 +237,7 @@ classDiagram
     +has_agent_backend(kind) bool
   }
   class Session {
-    +chat(route, model, input, max_tokens, on_delta, on_thinking) ChatOutput
+    +chat(model, req) ChatStream
     +run_loop(req, handler) LoopOutcome
     +fork(history) Session
     +history() Vec~ChatMessage~
@@ -389,18 +395,13 @@ classDiagram
   }
   class Provider {
     <<interface>>
-    +id() str
+    +name() str
     +list_models() Vec~ModelInfo~
-    +chat(model: ModelId, req: ChatRequest) BoxStream~ChatEvent~
+    +chat(model, req: ChatRequest) ChatStream
     +quota() Quota
   }
   class Session {
-    +send(req: ChatRequest) BoxStream~ChatEvent~
-    +collect(req: ChatRequest) ChatResponse
-  }
-  class ModelId {
-    -raw: String
-    +raw() str
+    +chat(model, req: ChatRequest) ChatStream
   }
   class ModelInfo {
     +id: String
@@ -418,8 +419,8 @@ classDiagram
   }
   class ChatRequest {
     +messages: Vec~ChatMessage~
-    +system: str
-    +max_tokens: u32
+    +tools: Vec~ToolSpec~
+    +max_tokens: Option~u32~
     +extra: Value
   }
   class ChatMessage {
@@ -428,15 +429,15 @@ classDiagram
   }
   class ChatEvent {
     <<enumeration>>
-    TextDelta(String)
-    ToolCall(ToolCall)
-    Usage(Usage)
-    Done(ChatResponse)
+    TextDelta(text)
+    ThinkingDelta(text)
+    Done(Completion)
   }
-  class ChatResponse {
+  class Completion {
     +text: String
-    +usage: Usage
-    +raw: Value
+    +thinking: Option~String~
+    +tool_calls: Vec~ToolCall~
+    +usage: Option~Usage~
   }
   class Usage {
     +prompt_tokens: u64
@@ -469,7 +470,8 @@ classDiagram
     -base_url: String
     -api_key: String
     -zdr: bool
-    -route_for(model: ModelInfo) Wire
+    -wire: Option~Wire~
+    -auto_wire(model, req) Wire
   }
   class Wire {
     <<enumeration>>
@@ -512,14 +514,14 @@ classDiagram
   ModelInfo *-- Capabilities : capabilities
   ModelInfo ..> CommandCodeModelExtra : extra_as
   ChatRequest *-- ChatMessage : messages
-  ChatEvent ..> ChatResponse : Done
+  ChatEvent ..> Completion : Done
   ChatEvent ..> Usage : Usage
-  ChatResponse *-- Usage : usage
+  Completion *-- Usage : usage
 
   note for Provider "chatは1本だけ。wire選択は実装の中\nassociated type禁止(dyn維持)\n独自拡張は extra: Value のみ\n(as_anyはプロセス境界を越えないため廃止)\nquota未対応は Err(Unsupported)"
   note for ChatEvent "非ストリームは Stream を collect するだけ\nstream on/off は表示側(Frontend)の都合"
   note for ModelInfo "カタログ由来(GET /models)\n正規化 + extraに生値温存"
-  note for ChatResponse "リクエスト由来(body/header)\ntext以外捨てない: usage + raw"
+  note for Completion "リクエスト由来(body/header)\n差分をつないだ本文 + ツール呼び出し + usage"
   note for Error "kernelは特定実装を知らない\nreqwest::Error等は Plugin.source に包む"
   note for ProviderFactory "cfg は config の providers.instance\n(+ CLIの -o key=value) をマージした生値\n同じkindで複数インスタンス可"
 ```

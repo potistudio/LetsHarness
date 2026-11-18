@@ -12,7 +12,9 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
-use letsharness_kernel::{self as llm, AgentBackend, BootConfig, ChatMessage, Host, Kernel, Route, Session, SessionId};
+use letsharness_kernel::{
+	self as llm, AgentBackend, BootConfig, ChatMessage, ChatRequest, Host, Kernel, Session, SessionId,
+};
 
 fn main() -> ExitCode {
 	match run_cli() {
@@ -32,6 +34,12 @@ fn run_cli() -> Result<()> {
 		config.profile = Some(profile.clone());
 	}
 	config.patches = cli.patch.clone();
+	if let Some(path) = &cli.config {
+		if !path.is_file() {
+			bail!("--config {}: ファイルがありません", path.display());
+		}
+		config.config_file = Some(path.clone());
+	}
 	// プラグインの管理はプラグインを起動しない。
 	if let Cmd::Plugin { cmd } = &cli.cmd {
 		return run_plugin(&config, cmd);
@@ -138,9 +146,11 @@ fn parse_option(s: &str) -> std::result::Result<(String, String), String> {
 #[derive(Parser)]
 #[command(name = "letsharness", about = "Command Code Provider API をRustから直接叩く")]
 struct Cli {
-	/// モデルの差し替えポイント (登録されたプロバイダの kind): commandcode | gemini | mock
-	#[arg(long, global = true, default_value = "commandcode")]
-	provider: String,
+	/// モデルの差し替えポイント: 設定ファイルの `[providers.NAME]` か、プロバイダの kind (commandcode | gemini | mock)
+	///
+	/// 省略すると設定ファイルの `default_provider`、それも無ければ commandcode。
+	#[arg(long, global = true)]
+	provider: Option<String>,
 	/// 外部エージェントの kind (`agent` で必須。`models` で指定すると、そのエージェントのモデルを引く)
 	///
 	/// antigravity : Antigravity CLI (`agy`) に丸ごと任せる (ツール・認証も agy 側)
@@ -157,6 +167,9 @@ struct Cli {
 	/// profile の後に重ねるパッチ (指定順。プラグインの有効/無効・並び順・設定を変える)
 	#[arg(long, global = true, value_name = "FILE")]
 	patch: Vec<std::path::PathBuf>,
+	/// 設定ファイル (既定は $LETSHARNESS_CONFIG、無ければ <home>/config.toml)。`default_provider` と `[providers.NAME]`
+	#[arg(long, global = true, value_name = "FILE")]
+	config: Option<std::path::PathBuf>,
 
 	#[command(subcommand)]
 	cmd: Cmd,
@@ -174,7 +187,7 @@ enum Cmd {
 		json: bool,
 	},
 
-	/// POST /chat/completions (Claudeは自動で/messagesに切替)
+	/// モデルを1回呼ぶ (wire はプロバイダが選ぶ。commandcode は claude-* なら /messages、他は /chat/completions)
 	Chat {
 		#[arg(long)]
 		model: String,
@@ -184,9 +197,10 @@ enum Cmd {
 		system: Option<String>,
 		#[arg(long)]
 		max_tokens: Option<u32>,
+		/// 本文が届くたびに表示する (届き方はプロバイダの wire 次第)
 		#[arg(long, default_value_t = false)]
 		stream: bool,
-		/// auto | chat | responses | messages
+		/// wire の指定: auto | chat | responses | messages (プロバイダへ `extra.wire` として渡る。commandcode が使う)
 		#[arg(long, default_value = "auto")]
 		route: String,
 		/// レスポンスの `usage` (prompt/completion tokens) をstderrに表示
@@ -357,8 +371,14 @@ fn ensure_provider_only(backend: &Option<String>, command: &str) -> Result<()> {
 }
 
 async fn run(host: &Host, cli: Cli) -> Result<()> {
+	let provider = cli
+		.provider
+		.clone()
+		.or_else(|| host.default_provider().map(str::to_owned))
+		.unwrap_or_else(|| "commandcode".into());
+	let provider = provider.as_str();
 	// 外部エージェントだけ使うときに Provider の認証を要求しないよう、必要になるまで作らない。
-	let session = || async { make_session(host, &cli.provider, &options_cfg(&cli.options)).await };
+	let session = || async { make_session(host, provider, &options_cfg(&cli.options)).await };
 
 	match cli.cmd {
 		Cmd::Models { limit, json } => {
@@ -414,7 +434,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 		} => {
 			ensure_provider_only(&cli.backend, "chat")?;
 			let cfg = options_cfg(&cli.options);
-			let session = open_session(host, &cli.provider, &cfg, resume.as_deref(), system.as_ref()).await?;
+			let session = open_session(host, provider, &cfg, resume.as_deref(), system.as_ref()).await?;
 			run_chat(
 				&session,
 				model,
@@ -450,7 +470,7 @@ async fn run(host: &Host, cli: Cli) -> Result<()> {
 			let mut cfg = options_cfg(&cli.options);
 			cfg["workdir"] = json!(workdir);
 			exec::run_loop(
-				&open_session(host, &cli.provider, &cfg, resume.as_deref(), system.as_ref()).await?,
+				&open_session(host, provider, &cfg, resume.as_deref(), system.as_ref()).await?,
 				exec::Options {
 					model,
 					prompt,
@@ -525,37 +545,27 @@ async fn run_chat(
 	}
 	msgs.push(ChatMessage::user(prompt));
 
-	// ルーティング決定
-	let wire = if route != "auto" {
-		route.clone()
-	} else if model.starts_with("claude-") {
-		"messages".to_string()
-	} else {
-		// カタログがあればresponses対応を確認 (失敗時はchat)
-		match session.list_models().await {
-			Ok(models) => {
-				let found = models.iter().find(|m| m.id == model);
-				llm::route_for_model(&model, found.and_then(|m| m.supported_endpoints.as_deref())).to_string()
-			}
-			Err(_) => "chat/completions".to_string(),
-		}
+	let req = ChatRequest {
+		max_tokens,
+		extra: match route.as_str() {
+			"auto" => Value::Null,
+			wire => json!({ "wire": wire }),
+		},
+		..ChatRequest::new(msgs)
 	};
-	let (route, max_tokens) = match wire.as_str() {
-		"messages" => (Route::Messages, Some(max_tokens.unwrap_or(1024))),
-		"responses" if !stream => (Route::Responses, max_tokens),
-		_ if stream => (Route::Stream, max_tokens),
-		_ => (Route::Chat, max_tokens),
-	};
+	let live = stream && !json_output;
 
-	// ストリーム時のみ呼ばれる。Thinking は本文とは別に stderr へ逐次出す。JSON時・--no-thinking時は抑止。
+	// `--stream` 時のみ表示する。Thinking は本文とは別に stderr へ逐次出す。JSON時・--no-thinking時は抑止。
 	// 本文の最初のデルタが来たら思考ブロックを閉じる (thinking→text の順で読みやすく)。
 	let thinking_open = AtomicBool::new(false);
 	let thinking_closed = AtomicBool::new(false);
 	let mut stdout = std::io::stdout();
+	let streamed = AtomicBool::new(false);
 	let mut on_delta = |d: &str| {
-		if json_output {
+		if !live {
 			return;
 		}
+		streamed.store(true, Ordering::SeqCst);
 		if !no_thinking && thinking_open.load(Ordering::SeqCst) && !thinking_closed.load(Ordering::SeqCst) {
 			eprintln!("\n--- end of thinking ---");
 			thinking_closed.store(true, Ordering::SeqCst);
@@ -564,7 +574,7 @@ async fn run_chat(
 		let _ = stdout.flush();
 	};
 	let mut on_thinking = |t: &str| {
-		if json_output || no_thinking {
+		if !live || no_thinking {
 			return;
 		}
 		// 本文開始後に思考が来る稀な形ではブロックを再開する。
@@ -575,11 +585,9 @@ async fn run_chat(
 		eprint!("{t}");
 		let _ = std::io::stderr().flush();
 	};
-	let out = session
-		.chat(route, &model, msgs, max_tokens, &mut on_delta, &mut on_thinking)
-		.await?;
+	let out = llm::collect(session.chat(&model, req), &mut on_delta, &mut on_thinking).await?;
 
-	let streamed = route == Route::Stream && !json_output;
+	let streamed = streamed.load(Ordering::SeqCst);
 	let header_printed = thinking_open.load(Ordering::SeqCst);
 	if header_printed && !thinking_closed.load(Ordering::SeqCst) && !json_output && !no_thinking {
 		eprintln!("\n--- end of thinking ---");

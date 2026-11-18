@@ -1,4 +1,4 @@
-//! Kernel の起動。プラグインを発見してパッチ層を重ね、`boot` を呼んでから `Host` を返す。
+//! Kernel の起動。設定ファイルを読み、プラグインを発見してパッチ層を重ね、`boot` を呼んでから `Host` を返す。
 //!
 //! Client は `Kernel::boot` を呼ぶだけで、どのプラグインがあるかは知らない。
 
@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::external::{Connection, PluginEntry, default_plugin_path, discover};
 use crate::profile::{DEFAULT_PROFILE, Layer, Patch, PluginState, compose, home_dir, profile_patch_path};
-use crate::{Error, Host, Result};
+use crate::{CONFIG_FILE, Config, Error, Host, Result};
 
 pub struct BootConfig {
 	/// `-o key=value`。`boot` を持つプラグインにそのまま渡る (例: dotenv の `env_file`)。
@@ -24,6 +24,8 @@ pub struct BootConfig {
 	pub patches: Vec<PathBuf>,
 	/// セッションログの保存先 (既定は `<home>/sessions`)。`None` ならログを残さず、再開もできない。
 	pub sessions_dir: Option<PathBuf>,
+	/// 設定ファイル (既定は `$LETSHARNESS_CONFIG`、無ければ `<home>/config.toml`)。ファイルが無ければ空の設定。
+	pub config_file: Option<PathBuf>,
 }
 
 impl BootConfig {
@@ -35,6 +37,9 @@ impl BootConfig {
 			profile: Some(std::env::var("LETSHARNESS_PROFILE").unwrap_or_else(|_| DEFAULT_PROFILE.into())),
 			patches: Vec::new(),
 			sessions_dir: home_dir().map(|h| h.join("sessions")),
+			config_file: std::env::var_os("LETSHARNESS_CONFIG")
+				.map(PathBuf::from)
+				.or_else(|| home_dir().map(|h| h.join(CONFIG_FILE))),
 		}
 	}
 
@@ -69,6 +74,10 @@ impl Kernel {
 	///
 	/// Kernel 自身は環境変数を書き換えない。
 	pub async fn boot(config: BootConfig) -> Result<Host> {
+		let settings = match &config.config_file {
+			Some(path) => Config::load_or_default(path)?,
+			None => Config::default(),
+		};
 		let plugins: Vec<PluginState> = Self::plugins(&config)?.into_iter().filter(|p| p.enabled).collect();
 		let options: Value = Value::Object(config.options.iter().map(|(k, v)| (k.clone(), json!(v))).collect());
 
@@ -88,6 +97,6 @@ impl Kernel {
 			.into_iter()
 			.map(|p| Arc::new(PluginEntry::new(p.manifest, p.config, env.clone())))
 			.collect();
-		Ok(Host::new(entries, config.sessions_dir))
+		Ok(Host::new(entries, config.sessions_dir, settings))
 	}
 }

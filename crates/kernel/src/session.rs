@@ -11,26 +11,14 @@ use std::sync::Arc;
 
 use crate::session_log::{SessionId, SessionLog};
 use crate::{
-	ChatMessage, ChatOutput, Completion, Error, HookRegistry, LoopOutcome, LoopRequest, ModelInfo, ModelRequest,
-	Provider, Quota, Result, RunHandler, ToolRegistry, run_loop,
+	ChatMessage, ChatRequest, ChatSink, ChatStream, Completion, Error, HookRegistry, LoopOutcome, LoopRequest,
+	ModelInfo, ModelRequest, Provider, Quota, Result, RunHandler, ToolRegistry, chat_stream, collect, run_loop,
 };
-
-/// [`Session::chat`] で Provider のどの呼び方を使うか。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Route {
-	/// `chat/completions` (非ストリーム)。
-	Chat,
-	/// `chat/completions` のストリーム。差分は Hook を通す前に流れる。
-	Stream,
-	/// `responses`。メッセージの本文を改行でつないだものを入力にする。
-	Responses,
-	/// `messages` (Anthropic)。最初の `system` メッセージを `system` にする。`max_tokens` が必要。
-	Messages,
-}
 
 /// 会話をまたいで共有する部品 (プラグインとのやりとりなしに [`Session::fork`] できるように)。
 struct Core {
-	provider_kind: String,
+	/// `--provider` の名前 (設定ファイルのインスタンス名か kind)。ログに残り、再開に使う。
+	provider_ref: String,
 	provider: Arc<dyn Provider>,
 	tools: ToolRegistry,
 	hooks: HookRegistry,
@@ -56,7 +44,7 @@ impl std::fmt::Debug for Session {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("Session")
 			.field("id", &self.id)
-			.field("provider", &self.core.provider_kind)
+			.field("provider", &self.core.provider_ref)
 			.finish_non_exhaustive()
 	}
 }
@@ -65,7 +53,7 @@ impl Session {
 	/// 部品から作る (in-process で使うとき・テスト用)。ログは残さない。通常は [`Host::session`](crate::Host::session)。
 	pub fn new(provider: Arc<dyn Provider>, tools: ToolRegistry, hooks: HookRegistry) -> Self {
 		let core = Core {
-			provider_kind: provider.name().to_owned(),
+			provider_ref: provider.name().to_owned(),
 			provider,
 			tools,
 			hooks,
@@ -74,16 +62,16 @@ impl Session {
 		Self::start(Arc::new(core), SessionId::generate(), Vec::new(), 0)
 	}
 
-	/// `provider_kind` の `provider` で、`log_dir` にログを残す新しい会話。
+	/// `provider_ref` (`--provider` の名前) の `provider` で、`log_dir` にログを残す新しい会話。
 	pub(crate) fn create(
-		provider_kind: &str,
+		provider_ref: &str,
 		provider: Arc<dyn Provider>,
 		tools: ToolRegistry,
 		hooks: HookRegistry,
 		log_dir: Option<PathBuf>,
 	) -> Self {
 		let core = Core {
-			provider_kind: provider_kind.to_owned(),
+			provider_ref: provider_ref.to_owned(),
 			provider,
 			tools,
 			hooks,
@@ -95,7 +83,7 @@ impl Session {
 	/// ログから読んだ `history` の続きとして、同じ `id` で再開する。
 	pub(crate) fn resumed(
 		provider: Arc<dyn Provider>,
-		provider_kind: &str,
+		provider_ref: &str,
 		tools: ToolRegistry,
 		hooks: HookRegistry,
 		log_dir: PathBuf,
@@ -103,7 +91,7 @@ impl Session {
 		history: Vec<ChatMessage>,
 	) -> Self {
 		let core = Core {
-			provider_kind: provider_kind.to_owned(),
+			provider_ref: provider_ref.to_owned(),
 			provider,
 			tools,
 			hooks,
@@ -117,7 +105,7 @@ impl Session {
 		let log = core
 			.log_dir
 			.as_ref()
-			.map(|dir| Arc::new(SessionLog::new(dir, &id, &core.provider_kind)));
+			.map(|dir| Arc::new(SessionLog::new(dir, &id, &core.provider_ref)));
 		Self {
 			core,
 			id,
@@ -142,9 +130,9 @@ impl Session {
 		self.log.is_some()
 	}
 
-	/// Provider の kind (`--provider` の名前)。
-	pub fn provider_kind(&self) -> &str {
-		&self.core.provider_kind
+	/// `--provider` の名前 (設定ファイルのインスタンス名か kind)。
+	pub fn provider(&self) -> &str {
+		&self.core.provider_ref
 	}
 
 	/// Provider の名前。
@@ -186,88 +174,50 @@ impl Session {
 		}
 	}
 
-	/// ツールを使わない1回のモデル呼び出し。`input` (このターンの新しいメッセージ) を履歴に続けて送る。
+	/// ツールを使わない1回のモデル呼び出し。`req.messages` (このターンの新しいメッセージ) を履歴に続けて送る。
 	///
-	/// `before_request` / `after_response` の Hook を通し、Observer に知らせる。成功したときだけ
-	/// `input` と応答が履歴に加わる (失敗・中断したターンは履歴に残らない)。
-	/// Hook が足したツールやツール呼び出しは使わない (ツールを使うなら [`run_loop`](Self::run_loop))。
-	/// [`Route::Stream`] の差分は Hook を通す前の本文で、Hook の書き換えは戻り値と履歴にだけ効く。
-	pub async fn chat(
-		&self,
-		route: Route,
-		model: &str,
-		input: Vec<ChatMessage>,
-		max_tokens: Option<u32>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<ChatOutput> {
-		let mut conversation = self.conversation.lock().await;
-		let mut history = conversation.history.clone();
-		history.extend(input);
-		let hooks = self.hooks();
-		let req = ModelRequest {
-			model: model.to_owned(),
-			messages: history.clone(),
-			tools: Vec::new(),
-			max_tokens,
-		};
-		let out = self.chat_once(&hooks, route, req, on_delta, on_thinking).await;
-		if let Ok(out) = &out {
-			history.push(ChatMessage::assistant(out.text.clone()));
-			self.commit(&mut conversation, history);
-		}
-		hooks.flush().await;
-		out
+	/// `before_request` / `after_response` の Hook を通し、Observer に知らせる。差分 (`*_delta`) は Hook を通す前の
+	/// 本文で、最後の [`ChatEvent::Done`](crate::ChatEvent::Done) が Hook を通した応答。成功したときだけ
+	/// `req.messages` と応答が履歴に加わる (失敗したターンは残らない)。ストリームを途中で捨てるとターンはそこで止まり、
+	/// 終わっていなければ履歴に残らない。
+	///
+	/// ツールは使わない: `req.tools` が空でなければ `Err(Config)`、Hook が足したツールも送らない
+	/// (ツールを使うなら [`run_loop`](Self::run_loop))。
+	pub fn chat<'a>(&'a self, model: &'a str, req: ChatRequest) -> ChatStream<'a> {
+		chat_stream(move |sink| async move {
+			if !req.tools.is_empty() {
+				return Err(Error::Config(
+					"Session::chat はツールを使いません (ツールは run_loop で使います)".into(),
+				));
+			}
+			let mut conversation = self.conversation.lock().await;
+			let mut history = conversation.history.clone();
+			history.extend(req.messages);
+			let hooks = self.hooks();
+			let request = ChatRequest {
+				messages: history.clone(),
+				tools: Vec::new(),
+				max_tokens: req.max_tokens,
+				extra: req.extra,
+			};
+			let out = self.chat_once(&hooks, ModelRequest::new(model, request), &sink).await;
+			if let Ok(out) = &out {
+				history.push(ChatMessage::assistant(out.text.clone()));
+				self.commit(&mut conversation, history);
+			}
+			hooks.flush().await;
+			out
+		})
 	}
 
-	async fn chat_once(
-		&self,
-		hooks: &HookRegistry,
-		route: Route,
-		req: ModelRequest,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<ChatOutput> {
-		let ModelRequest {
-			model,
-			messages,
-			max_tokens,
-			..
-		} = hooks.before_request(req).await?;
-		let p = &self.core.provider;
-		let out = match route {
-			Route::Chat => p.chat_with_usage(&model, messages, max_tokens).await?,
-			Route::Stream => {
-				p.chat_stream_with_usage(&model, messages, on_delta, on_thinking)
-					.await?
-			}
-			Route::Responses => {
-				let input = messages
-					.iter()
-					.map(|m| m.content.as_str())
-					.collect::<Vec<_>>()
-					.join("\n");
-				p.responses_with_usage(&model, &input).await?
-			}
-			Route::Messages => {
-				let max = max_tokens.ok_or_else(|| Error::Config("messages には max_tokens が必要です".into()))?;
-				let system = messages.iter().find(|m| m.role == "system").map(|m| m.content.clone());
-				p.messages_with_usage(&model, messages, system.as_deref(), max).await?
-			}
-		};
-		let completion = hooks
-			.after_response(Completion {
-				text: out.text,
-				thinking: out.thinking,
-				tool_calls: Vec::new(),
-				usage: out.usage,
-			})
-			.await?;
-		Ok(ChatOutput {
-			text: completion.text,
-			thinking: completion.thinking,
-			usage: completion.usage,
-		})
+	async fn chat_once(&self, hooks: &HookRegistry, req: ModelRequest, sink: &ChatSink) -> Result<Completion> {
+		let (model, mut req) = hooks.before_request(req).await?.into_parts();
+		req.tools.clear();
+		let stream = self.core.provider.chat(&model, req);
+		let completion = collect(stream, &mut |t| sink.text(t), &mut |t| sink.thinking(t)).await?;
+		let mut completion = hooks.after_response(completion).await?;
+		completion.tool_calls.clear();
+		Ok(completion)
 	}
 
 	/// ツールを使いながら最終回答までループを回す ([`run_loop`])。`req.messages` はこのターンの新しいメッセージで、
@@ -294,7 +244,7 @@ mod tests {
 	use super::*;
 	use crate::{Event, Hook, HookPoint, Observer};
 
-	/// 受け取ったメッセージ数と最後の本文を返す Provider。
+	/// 受け取ったメッセージ数と最後の本文を返す Provider。本文は1文字ずつ差分で流し、`extra` があれば添える。
 	struct Echo;
 
 	#[async_trait::async_trait]
@@ -305,25 +255,23 @@ mod tests {
 		async fn list_models(&self) -> Result<Vec<ModelInfo>> {
 			Ok(vec![])
 		}
-		async fn chat(&self, _: &str, messages: Vec<ChatMessage>, _: Option<u32>) -> Result<String> {
-			Ok(format!("{}:{}", messages.len(), messages.last().unwrap().content))
-		}
-		async fn chat_stream(
-			&self,
-			model: &str,
-			messages: Vec<ChatMessage>,
-			on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-			_: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		) -> Result<String> {
-			let text = self.chat(model, messages, None).await?;
-			on_delta(&text);
-			Ok(text)
-		}
-		async fn responses(&self, _: &str, input: &str) -> Result<String> {
-			Ok(format!("responses:{input}"))
-		}
-		async fn messages(&self, _: &str, _: Vec<ChatMessage>, system: Option<&str>, max: u32) -> Result<String> {
-			Ok(format!("messages:{system:?}:{max}"))
+		fn chat<'a>(&'a self, _: &'a str, req: ChatRequest) -> ChatStream<'a> {
+			chat_stream(move |sink| async move {
+				let mut text = format!("{}:{}", req.messages.len(), req.messages.last().unwrap().content);
+				if !req.extra.is_null() {
+					text.push_str(&format!(":{}", req.extra));
+				}
+				if let Some(max) = req.max_tokens {
+					text.push_str(&format!(":{max}"));
+				}
+				for c in text.chars() {
+					sink.text(&c.to_string());
+				}
+				Ok(Completion {
+					text,
+					..Default::default()
+				})
+			})
 		}
 	}
 
@@ -372,47 +320,63 @@ mod tests {
 		Session::new(Arc::new(Echo), ToolRegistry::new(), hooks)
 	}
 
-	async fn chat(s: &Session, route: Route, max_tokens: Option<u32>) -> Result<String> {
+	/// `(応答, 差分をつないだもの)`。
+	async fn chat_with(s: &Session, req: ChatRequest) -> Result<(String, String)> {
 		let mut deltas = String::new();
-		let out = s
-			.chat(
-				route,
-				"m",
-				vec![ChatMessage::user("hi")],
-				max_tokens,
-				&mut |d| deltas.push_str(d),
-				&mut |_| {},
-			)
-			.await?;
-		Ok(format!("{}|{deltas}", out.text))
+		let out = collect(s.chat("m", req), &mut |d| deltas.push_str(d), &mut |_| {}).await?;
+		Ok((out.text, deltas))
+	}
+
+	async fn chat(s: &Session) -> Result<String> {
+		Ok(chat_with(s, ChatRequest::new(vec![ChatMessage::user("hi")])).await?.0)
 	}
 
 	#[tokio::test]
-	async fn every_route_goes_through_the_hooks() {
+	async fn chat_goes_through_the_hooks() {
 		let rec = Arc::new(Rec::default());
 		let s = session(&rec);
-		// 会話ごとに履歴が分かれるよう、経路ごとに fork する
-		assert_eq!(chat(&s.fork(vec![]), Route::Chat, None).await.unwrap(), "<2:hi>|");
-		// ストリームの差分は Hook 前の本文
-		assert_eq!(chat(&s.fork(vec![]), Route::Stream, None).await.unwrap(), "<2:hi>|2:hi");
+		// 差分は Hook 前の本文、最後の応答は Hook 後
 		assert_eq!(
-			chat(&s.fork(vec![]), Route::Responses, None).await.unwrap(),
-			"<responses:sys\nhi>|"
+			chat_with(&s, ChatRequest::new(vec![ChatMessage::user("hi")]))
+				.await
+				.unwrap(),
+			("<2:hi>".into(), "2:hi".into())
+		);
+		let req = ChatRequest {
+			max_tokens: Some(9),
+			extra: serde_json::json!({ "wire": "x" }),
+			..ChatRequest::new(vec![ChatMessage::user("hi")])
+		};
+		assert_eq!(
+			chat_with(&s.fork(vec![]), req).await.unwrap().0,
+			r#"<2:hi:{"wire":"x"}:9>"#,
+			"max_tokens and extra reach the provider"
 		);
 		assert_eq!(
-			chat(&s.fork(vec![]), Route::Messages, Some(9)).await.unwrap(),
-			r#"<messages:Some("sys"):9>|"#
+			*rec.events.lock().unwrap(),
+			["request", "response", "request", "response"]
 		);
-		assert_eq!(rec.events.lock().unwrap().len(), 8);
-		assert_eq!(*rec.flushed.lock().unwrap(), 4, "each call flushes the observers");
+		assert_eq!(*rec.flushed.lock().unwrap(), 2, "each call flushes the observers");
 	}
 
 	#[tokio::test]
-	async fn messages_requires_max_tokens_and_still_flushes() {
+	async fn chat_refuses_tools() {
 		let rec = Arc::new(Rec::default());
-		let err = chat(&session(&rec), Route::Messages, None).await.unwrap_err();
-		assert!(matches!(err, Error::Config(_)));
-		assert_eq!(*rec.flushed.lock().unwrap(), 1);
+		let req = ChatRequest {
+			tools: vec![spec()],
+			..ChatRequest::new(vec![ChatMessage::user("hi")])
+		};
+		let s = session(&rec);
+		assert!(matches!(chat_with(&s, req).await, Err(Error::Config(_))));
+		assert!(s.history().await.is_empty());
+	}
+
+	fn spec() -> crate::ToolSpec {
+		crate::ToolSpec {
+			name: "t".into(),
+			description: String::new(),
+			input_schema: serde_json::json!({}),
+		}
 	}
 
 	fn contents(messages: &[ChatMessage]) -> Vec<String> {
@@ -422,10 +386,20 @@ mod tests {
 	#[tokio::test]
 	async fn history_grows_only_with_successful_turns() {
 		let s = session(&Arc::default());
-		assert_eq!(chat(&s, Route::Chat, None).await.unwrap(), "<2:hi>|");
+		assert_eq!(chat(&s).await.unwrap(), "<2:hi>");
 		// 2回目は前のターンを含む (sys は Hook がリクエストにだけ足すので履歴には無い)
-		assert_eq!(chat(&s, Route::Chat, None).await.unwrap(), "<4:hi>|");
-		assert!(chat(&s, Route::Messages, None).await.is_err());
+		assert_eq!(chat(&s).await.unwrap(), "<4:hi>");
+		assert!(
+			chat_with(
+				&s,
+				ChatRequest {
+					tools: vec![spec()],
+					..ChatRequest::new(vec![ChatMessage::user("x")])
+				}
+			)
+			.await
+			.is_err()
+		);
 		assert_eq!(
 			contents(&s.history().await),
 			["user:hi", "assistant:<2:hi>", "user:hi", "assistant:<4:hi>"]
@@ -433,7 +407,7 @@ mod tests {
 		// fork は履歴を引き継いだ別の会話
 		let forked = s.fork(s.history().await);
 		assert_ne!(forked.id(), s.id());
-		assert_eq!(chat(&forked, Route::Chat, None).await.unwrap(), "<6:hi>|");
+		assert_eq!(chat(&forked).await.unwrap(), "<6:hi>");
 		assert_eq!(s.history().await.len(), 4);
 	}
 
@@ -448,10 +422,10 @@ mod tests {
 			Some(dir.clone()),
 		);
 		let seeded = s.fork(vec![ChatMessage::user("old"), ChatMessage::assistant("reply")]);
-		chat(&seeded, Route::Chat, None).await.unwrap();
+		chat(&seeded).await.unwrap();
 		let path = crate::log_path(&dir, seeded.id());
-		let (kind, history) = crate::session_log::read(&path, seeded.id()).unwrap();
-		assert_eq!(kind, "echo");
+		let (provider, history) = crate::session_log::read(&path, seeded.id()).unwrap();
+		assert_eq!(provider, "echo");
 		assert_eq!(history.len(), 4, "seeded history is written with the first turn");
 		assert_eq!(contents(&history), contents(&seeded.history().await));
 		// モデルに見えたもの (Hook が足した sys を含む) は event として残る

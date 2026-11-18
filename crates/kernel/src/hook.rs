@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ChatMessage, Completion, Event, Observer, Result, ToolCall, ToolOutput, ToolSpec};
+use crate::{ChatMessage, ChatRequest, Completion, Event, Observer, Result, ToolCall, ToolOutput, ToolSpec};
 
 /// Hook が割り込める箇所。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,13 +25,39 @@ pub enum HookPoint {
 	AfterToolCall,
 }
 
-/// モデルへの1回分のリクエスト。
+/// モデルへの1回分のリクエスト ([`ChatRequest`] に送り先のモデルを足したもの)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRequest {
 	pub model: String,
 	pub messages: Vec<ChatMessage>,
 	pub tools: Vec<ToolSpec>,
 	pub max_tokens: Option<u32>,
+	/// Provider 固有の指定 ([`ChatRequest::extra`])。
+	#[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+	pub extra: serde_json::Value,
+}
+
+impl ModelRequest {
+	pub fn new(model: impl Into<String>, req: ChatRequest) -> Self {
+		Self {
+			model: model.into(),
+			messages: req.messages,
+			tools: req.tools,
+			max_tokens: req.max_tokens,
+			extra: req.extra,
+		}
+	}
+
+	/// `(model, Provider に渡す依頼)`。
+	pub fn into_parts(self) -> (String, ChatRequest) {
+		let req = ChatRequest {
+			messages: self.messages,
+			tools: self.tools,
+			max_tokens: self.max_tokens,
+			extra: self.extra,
+		};
+		(self.model, req)
+	}
 }
 
 /// [`Hook::on_tool_call`] の判断。

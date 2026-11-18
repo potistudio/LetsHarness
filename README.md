@@ -57,6 +57,22 @@ cargo run --release -- plugin disable guard
 ```
 
 `--profile NAME` picks another profile, and `--patch FILE` layers more changes (enable/disable, order, per-plugin config) on top.
+
+Name providers and pick the default one in `~/.letsharness/config.toml` (or `--config FILE`):
+
+```toml
+default_provider = "work"
+
+[providers.work]
+kind = "commandcode"
+wire = "messages"   # everything but `kind` goes to the provider
+
+[providers.echo]
+kind = "mock"
+prefix = ">> "
+```
+
+`--provider` takes one of these names or a provider kind; `-o KEY=VALUE` still overrides the table.
 See [docs/architecture.md](docs/architecture.md) for how plugins are discovered and written.
 
 ## License

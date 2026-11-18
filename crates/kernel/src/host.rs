@@ -13,22 +13,34 @@ use tokio::sync::{mpsc, oneshot};
 use crate::external::{Connection, EventSink, NoEvents, PluginEntry};
 use crate::session_log::{self, SessionId, log_path};
 use crate::{
-	AgentBackend, AgentOutcome, AgentRequest, ChatMessage, ChatOutput, Completion, Error, Event, Hook, HookPoint,
-	HookRegistry, ModelInfo, ModelRequest, Observer, Provider, Quota, Result, RunHandler, Session, Tool, ToolCall,
-	ToolDecision, ToolOutput, ToolRegistry, ToolSpec,
+	AgentBackend, AgentOutcome, AgentRequest, ChatRequest, ChatSink, ChatStream, Completion, Config, Error, Event,
+	Hook, HookPoint, HookRegistry, ModelInfo, ModelRequest, Observer, Provider, Quota, Result, RunHandler, Session,
+	Tool, ToolCall, ToolDecision, ToolOutput, ToolRegistry, ToolSpec, chat_stream,
 };
 
 pub struct Host {
 	entries: Arc<Vec<Arc<PluginEntry>>>,
 	sessions_dir: Option<PathBuf>,
+	config: Config,
 }
 
 impl Host {
-	pub(crate) fn new(entries: Vec<Arc<PluginEntry>>, sessions_dir: Option<PathBuf>) -> Self {
+	pub(crate) fn new(entries: Vec<Arc<PluginEntry>>, sessions_dir: Option<PathBuf>, config: Config) -> Self {
 		Self {
 			entries: Arc::new(entries),
 			sessions_dir,
+			config,
 		}
+	}
+
+	/// 設定ファイルの `default_provider` (`--provider` を省いたときに使う名前)。
+	pub fn default_provider(&self) -> Option<&str> {
+		self.config.default_provider.as_deref()
+	}
+
+	/// `--provider` に渡せる名前: 設定ファイルのインスタンス名 → プラグインの kind。
+	pub fn provider_names(&self) -> Vec<String> {
+		self.config.provider_names(&self.provider_kinds())
 	}
 
 	/// 見つかったプラグインの名前。
@@ -36,7 +48,8 @@ impl Host {
 		self.entries.iter().map(|e| e.manifest.name.as_str()).collect()
 	}
 
-	/// `kind` の Provider と、すべてのツール・Hook・Observer をまとめた [`Session`] を作る。
+	/// `provider` (設定ファイルのインスタンス名か kind) の Provider と、すべてのツール・Hook・Observer をまとめた
+	/// [`Session`] を作る。
 	///
 	/// Client がモデルを使う窓口はこれだけ。ツールより後に Hook を作るので、Hook はツールを見て設定を検証できる。
 	///
@@ -46,15 +59,15 @@ impl Host {
 		Ok(Session::create(provider, p, tools, hooks, self.sessions_dir.clone()))
 	}
 
-	/// セッションログから会話を復元し、続きから再開する。Provider はログに残った kind を使い、`cfg` は今回のもの。
+	/// セッションログから会話を復元し、続きから再開する。Provider はログに残った名前を使い、`cfg` は今回のもの。
 	pub async fn resume(&self, id: &SessionId, cfg: &Value) -> Result<Session> {
 		let dir = self
 			.sessions_dir
 			.clone()
 			.ok_or_else(|| Error::Config("セッションの保存先がありません ($LETSHARNESS_HOME / $HOME)".into()))?;
-		let (kind, history) = session_log::read(&log_path(&dir, id), id)?;
-		let (p, tools, hooks) = self.parts(&kind, cfg).await?;
-		Ok(Session::resumed(p, &kind, tools, hooks, dir, id.clone(), history))
+		let (provider, history) = session_log::read(&log_path(&dir, id), id)?;
+		let (p, tools, hooks) = self.parts(&provider, cfg).await?;
+		Ok(Session::resumed(p, &provider, tools, hooks, dir, id.clone(), history))
 	}
 
 	async fn parts(&self, provider: &str, cfg: &Value) -> Result<(Arc<dyn Provider>, ToolRegistry, HookRegistry)> {
@@ -67,16 +80,38 @@ impl Host {
 		Ok((provider, tools, hooks))
 	}
 
-	/// `kind` の Provider を作る (プラグインは初回に起動する)。
-	pub(crate) async fn provider(&self, kind: &str, cfg: &Value) -> Result<Arc<dyn Provider>> {
+	/// `name` (設定ファイルのインスタンス名か kind) の Provider を作る (プラグインは初回に起動する)。
+	///
+	/// cfg は「パッチ層のプラグイン設定 → 設定ファイルの表 → `cfg`」の順に上書きしたもの。
+	pub(crate) async fn provider(&self, name: &str, cfg: &Value) -> Result<Arc<dyn Provider>> {
+		let (kind, mut merged) = self.config.resolve(name);
 		let entry = self
 			.entries
 			.iter()
-			.find(|e| e.manifest.contributes.provider.iter().any(|k| k == kind))
-			.ok_or_else(|| unknown("provider", kind, self.provider_kinds()))?;
+			.find(|e| e.manifest.contributes.provider.contains(&kind))
+			.ok_or_else(|| {
+				if kind == name {
+					unknown(
+						"provider",
+						name,
+						self.provider_names().iter().map(String::as_str).collect(),
+					)
+				} else {
+					Error::Config(format!(
+						"providers.{name}: unknown kind: {kind} ({})",
+						self.provider_kinds().join("|")
+					))
+				}
+			})?;
+		if let Value::Object(cfg) = cfg {
+			merged.extend(cfg.iter().map(|(k, v)| (k.clone(), v.clone())));
+		}
 		let conn = entry.connection().await?;
 		let created = conn
-			.call("provider.create", json!({ "kind": kind, "cfg": entry.cfg(cfg) }))
+			.call(
+				"provider.create",
+				json!({ "kind": kind, "cfg": entry.cfg(&Value::Object(merged)) }),
+			)
 			.await?;
 		let (instance, name) = created_instance(entry.name, &created)?;
 		Ok(Arc::new(RemoteProvider { conn, instance, name }))
@@ -223,43 +258,22 @@ struct RemoteProvider {
 	name: &'static str,
 }
 
-/// ストリーム通知 (`stream.delta` / `stream.thinking`) をコールバックへ流す。
-struct StreamSink<'a> {
-	on_delta: &'a mut (dyn for<'x> FnMut(&'x str) + Send),
-	on_thinking: &'a mut (dyn for<'x> FnMut(&'x str) + Send),
-}
-
-impl EventSink for StreamSink<'_> {
+/// ストリーム通知 (`stream.delta` / `stream.thinking`) を [`ChatSink`] へ流す。
+impl EventSink for ChatSink {
 	fn on_event(&mut self, method: &str, params: Value) {
 		let text = params.get("text").and_then(Value::as_str).unwrap_or_default();
 		match method {
-			"stream.delta" => (self.on_delta)(text),
-			"stream.thinking" => (self.on_thinking)(text),
+			"stream.delta" => self.text(text),
+			"stream.thinking" => self.thinking(text),
 			_ => {}
 		}
 	}
 }
 
 impl RemoteProvider {
-	async fn call(&self, method: &str, mut params: Value, sink: &mut dyn EventSink) -> Result<Value> {
+	async fn rpc<R: DeserializeOwned>(&self, method: &str, mut params: Value, sink: &mut dyn EventSink) -> Result<R> {
 		params["instance"] = self.instance.into();
-		self.conn.start(method, params).await?.drive(sink).await
-	}
-
-	async fn rpc<R: DeserializeOwned>(&self, method: &str, params: Value) -> Result<R> {
-		let v = self.call(method, params, &mut NoEvents).await?;
-		serde_json::from_value(v).map_err(|e| Error::plugin(self.conn.name(), e))
-	}
-
-	async fn stream<R: DeserializeOwned>(
-		&self,
-		method: &str,
-		params: Value,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<R> {
-		let mut sink = StreamSink { on_delta, on_thinking };
-		let v = self.call(method, params, &mut sink).await?;
+		let v = self.conn.start(method, params).await?.drive(sink).await?;
 		serde_json::from_value(v).map_err(|e| Error::plugin(self.conn.name(), e))
 	}
 }
@@ -271,119 +285,18 @@ impl Provider for RemoteProvider {
 	}
 
 	async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-		self.rpc("provider.list_models", json!({})).await
+		self.rpc("provider.list_models", json!({}), &mut NoEvents).await
 	}
 
-	async fn chat(&self, model: &str, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<String> {
-		self.rpc(
-			"provider.chat",
-			json!({ "model": model, "messages": messages, "max_tokens": max_tokens }),
-		)
-		.await
-	}
-
-	async fn chat_stream(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<String> {
-		self.stream(
-			"provider.chat_stream",
-			json!({ "model": model, "messages": messages }),
-			on_delta,
-			on_thinking,
-		)
-		.await
-	}
-
-	async fn responses(&self, model: &str, input: &str) -> Result<String> {
-		self.rpc("provider.responses", json!({ "model": model, "input": input }))
-			.await
-	}
-
-	async fn messages(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<String> {
-		self.rpc(
-			"provider.messages",
-			json!({ "model": model, "messages": messages, "system": system, "max_tokens": max_tokens }),
-		)
-		.await
+	fn chat<'a>(&'a self, model: &'a str, req: ChatRequest) -> ChatStream<'a> {
+		chat_stream(move |mut sink| async move {
+			self.rpc("provider.chat", json!({ "model": model, "request": req }), &mut sink)
+				.await
+		})
 	}
 
 	async fn quota(&self) -> Result<Quota> {
-		self.rpc("provider.quota", json!({})).await
-	}
-
-	async fn chat_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		max_tokens: Option<u32>,
-	) -> Result<ChatOutput> {
-		self.rpc(
-			"provider.chat_with_usage",
-			json!({ "model": model, "messages": messages, "max_tokens": max_tokens }),
-		)
-		.await
-	}
-
-	async fn chat_stream_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<ChatOutput> {
-		self.stream(
-			"provider.chat_stream_with_usage",
-			json!({ "model": model, "messages": messages }),
-			on_delta,
-			on_thinking,
-		)
-		.await
-	}
-
-	async fn chat_with_tools(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		tools: &[ToolSpec],
-		max_tokens: Option<u32>,
-	) -> Result<Completion> {
-		self.rpc(
-			"provider.chat_with_tools",
-			json!({ "model": model, "messages": messages, "tools": tools, "max_tokens": max_tokens }),
-		)
-		.await
-	}
-
-	async fn responses_with_usage(&self, model: &str, input: &str) -> Result<ChatOutput> {
-		self.rpc(
-			"provider.responses_with_usage",
-			json!({ "model": model, "input": input }),
-		)
-		.await
-	}
-
-	async fn messages_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<ChatOutput> {
-		self.rpc(
-			"provider.messages_with_usage",
-			json!({ "model": model, "messages": messages, "system": system, "max_tokens": max_tokens }),
-		)
-		.await
+		self.rpc("provider.quota", json!({}), &mut NoEvents).await
 	}
 }
 

@@ -3,9 +3,12 @@
 //! Docs: https://commandcode.ai/docs/provider
 //! Base:  https://api.commandcode.ai/provider/v1
 //!
-//! - `claude-*`            -> POST /messages (Anthropic Messages)
-//! - それ以外              -> POST /chat/completions (OpenAI Chat Completions)
-//! - `supported_endpoints` に `/responses` を含む -> POST /responses も可
+//! wire は [`Provider::chat`] の中で選ぶ ([`Wire::for_model`])。`wire` (`auto` | `chat` | `responses` | `messages`)
+//! で決め打ちできる: リクエストごとなら `ChatRequest::extra` の `wire`、インスタンスごとなら cfg の `wire`
+//! (設定ファイルの `[providers.x]` や `-o wire=...`)。リクエストの指定が強い。
+//! - `claude-*`            -> POST /messages (Anthropic Messages, 非ストリーム)
+//! - カタログで `/chat/completions` が無く `/responses` がある -> POST /responses (非ストリーム, ツール不可)
+//! - それ以外              -> POST /chat/completions (ツールが無ければストリーム)
 //!
 //! [`CommandCodeProvider`] は [`Provider`] を実装するため、
 //! `Arc<dyn Provider>` として差し替え可能。
@@ -29,12 +32,52 @@ mod tools;
 use futures_util::StreamExt;
 
 use letsharness_kernel::{
-	ChatMessage, ChatOutput, Completion, Error, ModelInfo, Provider, Quota, QuotaWindow, Result, ToolSpec, Usage,
+	ChatMessage, ChatRequest, ChatSink, ChatStream, Completion, Error, ModelInfo, Provider, Quota, QuotaWindow, Result,
+	Usage, chat_stream,
 };
 
 use crate::tools::{
 	build_chat_tools_body, build_messages_tools_body, parse_chat_tools_response, parse_messages_tools_response,
 };
+
+/// リクエストを送る wire。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+	/// `POST /chat/completions`。
+	Chat,
+	/// `POST /responses`。
+	Responses,
+	/// `POST /messages` (Anthropic)。
+	Messages,
+}
+
+impl Wire {
+	/// `extra.wire` の値。`auto` (と未指定) は `None`。
+	pub fn parse(s: &str) -> Result<Option<Self>> {
+		match s {
+			"auto" => Ok(None),
+			"chat" | "chat/completions" => Ok(Some(Self::Chat)),
+			"responses" => Ok(Some(Self::Responses)),
+			"messages" => Ok(Some(Self::Messages)),
+			other => Err(Error::Config(format!(
+				"wire `{other}`: auto | chat | responses | messages のどれかです"
+			))),
+		}
+	}
+
+	/// 指定が無いときの wire。`supported` はカタログの `supported_endpoints` (分からなければ `None`)。
+	pub fn for_model(model: &str, supported: Option<&[String]>) -> Self {
+		if model.starts_with("claude-") {
+			return Self::Messages;
+		}
+		let has = |path: &str| supported.is_some_and(|eps| eps.iter().any(|e| e.contains(path)));
+		// ストリームできる chat/completions を優先し、それが無いモデルだけ responses にする。
+		if supported.is_some() && !has("/chat/completions") && has("/responses") {
+			return Self::Responses;
+		}
+		Self::Chat
+	}
+}
 
 const PLUGIN: &str = "commandcode";
 
@@ -148,6 +191,10 @@ pub struct CommandCodeProvider {
 
 	api_key: String,
 	zdr: bool,
+	/// cfg の `wire`。`None` なら自動。
+	wire: Option<Wire>,
+	/// `GET /models` の結果 (wire を選ぶときに初めて引く)。取れなければ `None`。
+	catalog: std::sync::Arc<tokio::sync::OnceCell<Option<Vec<ModelInfo>>>>,
 }
 
 impl CommandCodeProvider {
@@ -164,7 +211,15 @@ impl CommandCodeProvider {
 			base_url: base_url.into().trim_end_matches('/').to_string(),
 			api_key: api_key.into(),
 			zdr: false,
+			wire: None,
+			catalog: Default::default(),
 		})
+	}
+
+	/// リクエストに指定が無いときに使う wire (`None` なら自動)。
+	pub fn with_wire(mut self, wire: Option<Wire>) -> Self {
+		self.wire = wire;
+		self
 	}
 
 	/// Create a new instance with Zero Data Retention (ZDR) enabled.
@@ -301,79 +356,58 @@ impl Provider for CommandCodeProvider {
 		Ok(compose_quota(credits, subscription, summary))
 	}
 
-	async fn chat(&self, model: &str, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<String> {
-		Ok(self.chat_with_usage(model, messages, max_tokens).await?.text)
+	fn chat<'a>(&'a self, model: &'a str, req: ChatRequest) -> ChatStream<'a> {
+		chat_stream(move |sink| async move {
+			let wire = match req.extra.get("wire").and_then(|w| w.as_str()) {
+				Some(w) => Wire::parse(w)?,
+				None => self.wire,
+			};
+			let wire = match wire {
+				Some(wire) => wire,
+				None => self.auto_wire(model, &req).await,
+			};
+			match wire {
+				Wire::Chat if req.tools.is_empty() => self.chat_stream(model, &req, &sink).await,
+				Wire::Chat | Wire::Messages => {
+					let completion = self.with_tools(model, &req, wire == Wire::Messages).await?;
+					sink.thinking(completion.thinking.as_deref().unwrap_or_default());
+					sink.text(&completion.text);
+					Ok(completion)
+				}
+				Wire::Responses => {
+					let completion = self.responses(model, &req).await?;
+					sink.thinking(completion.thinking.as_deref().unwrap_or_default());
+					sink.text(&completion.text);
+					Ok(completion)
+				}
+			}
+		})
 	}
+}
 
-	async fn chat_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		max_tokens: Option<u32>,
-	) -> Result<ChatOutput> {
-		let started = std::time::Instant::now();
-		let mut body = serde_json::json!({
-			"model": model,
-			"messages": messages,
-			"stream": false,
-		});
-		if let Some(n) = max_tokens {
-			body["max_tokens"] = serde_json::json!(n);
+impl CommandCodeProvider {
+	/// 指定が無いときの wire。カタログは `claude-*` 以外でツールが無いときだけ引く (responses はツールを送れない)。
+	async fn auto_wire(&self, model: &str, req: &ChatRequest) -> Wire {
+		if model.starts_with("claude-") || !req.tools.is_empty() {
+			return Wire::for_model(model, None);
 		}
-		let res = self
-			.auth(
-				self.http_client
-					.post(format!("{}/chat/completions", self.base_url))
-					.json(&body),
-			)
-			.send()
-			.await
-			.map_err(transport)?;
-		let request_id = header_request_id(&res);
-		let res = self.check_error(res).await?;
-		let v: serde_json::Value = res.json().await.map_err(transport)?;
-		let text = v
-			.pointer("/choices/0/message/content")
-			.and_then(|c| c.as_str())
-			.unwrap_or_default()
-			.to_string();
-		let thinking = v.pointer("/choices/0/message").and_then(extract_chat_message_thinking);
-		let mut usage = v.get("usage").and_then(Usage::from_value);
-		if let Some(u) = usage.as_mut() {
-			u.latency_ms = Some(started.elapsed().as_millis() as u64);
-			u.request_id = request_id.or_else(|| v.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()));
-		}
-		Ok(ChatOutput { text, thinking, usage })
+		let catalog = self
+			.catalog
+			.get_or_init(|| async { self.list_models().await.ok() })
+			.await;
+		let supported = catalog
+			.as_deref()
+			.and_then(|models| models.iter().find(|m| m.id == model))
+			.and_then(|m| m.supported_endpoints.as_deref());
+		Wire::for_model(model, supported)
 	}
 
 	// -- POST /chat/completions (ストリーム, SSE) -----------------------------
-	async fn chat_stream(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<String> {
-		Ok(self
-			.chat_stream_with_usage(model, messages, on_delta, on_thinking)
-			.await?
-			.text)
-	}
-
-	async fn chat_stream_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<ChatOutput> {
+	async fn chat_stream(&self, model: &str, req: &ChatRequest, sink: &ChatSink) -> Result<Completion> {
 		let started = std::time::Instant::now();
-		let body = serde_json::json!({
-			"model": model,
-			"messages": messages,
-			"stream": true,
-			"stream_options": {"include_usage": true},
-		});
+		let mut body = build_chat_tools_body(model, &req.messages, &[], req.max_tokens);
+		body["stream"] = serde_json::json!(true);
+		body["stream_options"] = serde_json::json!({"include_usage": true});
 		let res = self
 			.auth(
 				self.http_client
@@ -420,14 +454,14 @@ impl Provider for CommandCodeProvider {
 							ttft_ms = Some(started.elapsed().as_millis() as u64);
 						}
 						thinking_buf.push_str(&delta);
-						on_thinking(&delta);
+						sink.thinking(&delta);
 					}
 					if let Some(delta) = v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
 						if ttft_ms.is_none() && !delta.is_empty() {
 							ttft_ms = Some(started.elapsed().as_millis() as u64);
 						}
 						full.push_str(delta);
-						on_delta(delta);
+						sink.text(delta);
 					}
 				}
 			}
@@ -437,39 +471,34 @@ impl Provider for CommandCodeProvider {
 			u.ttft_ms = ttft_ms;
 			u.request_id = request_id;
 		}
-		Ok(ChatOutput {
+		Ok(Completion {
 			text: full,
-			thinking: ChatOutput::normalized_thinking(Some(thinking_buf)),
+			thinking: Completion::normalized_thinking(Some(thinking_buf)),
+			tool_calls: Vec::new(),
 			usage,
 		})
 	}
 
-	// -- ツール付き1ターン (非ストリーム): claude-* は /messages、他は /chat/completions --
-	async fn chat_with_tools(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		tools: &[ToolSpec],
-		max_tokens: Option<u32>,
-	) -> Result<Completion> {
+	// -- 非ストリームの1ターン (ツール可): /messages か /chat/completions --
+	async fn with_tools(&self, model: &str, req: &ChatRequest, anthropic: bool) -> Result<Completion> {
 		let started = std::time::Instant::now();
-		let anthropic = letsharness_kernel::route_for_model(model, None) == "messages";
+		let (messages, tools, max_tokens) = (&req.messages, &req.tools, req.max_tokens);
 		let (path, body) = if anthropic {
 			(
 				"messages",
-				build_messages_tools_body(model, &messages, tools, max_tokens),
+				build_messages_tools_body(model, messages, tools, max_tokens),
 			)
 		} else {
 			(
 				"chat/completions",
-				build_chat_tools_body(model, &messages, tools, max_tokens),
+				build_chat_tools_body(model, messages, tools, max_tokens),
 			)
 		};
-		let mut req = self.http_client.post(format!("{}/{path}", self.base_url));
+		let mut http = self.http_client.post(format!("{}/{path}", self.base_url));
 		if anthropic {
-			req = req.header("anthropic-version", "2023-06-01");
+			http = http.header("anthropic-version", "2023-06-01");
 		}
-		let res = self.auth(req.json(&body)).send().await.map_err(transport)?;
+		let res = self.auth(http.json(&body)).send().await.map_err(transport)?;
 		let request_id = header_request_id(&res);
 		let res = self.check_error(res).await?;
 		let v: serde_json::Value = res.json().await.map_err(transport)?;
@@ -488,17 +517,9 @@ impl Provider for CommandCodeProvider {
 	}
 
 	// -- POST /responses (OpenAI Responses, 非ストリーム) ---------------------
-	async fn responses(&self, model: &str, input: &str) -> Result<String> {
-		Ok(self.responses_with_usage(model, input).await?.text)
-	}
-
-	async fn responses_with_usage(&self, model: &str, input: &str) -> Result<ChatOutput> {
+	async fn responses(&self, model: &str, req: &ChatRequest) -> Result<Completion> {
 		let started = std::time::Instant::now();
-		let body = serde_json::json!({
-			"model": model,
-			"input": input,
-			"stream": false,
-		});
+		let body = build_responses_body(model, req)?;
 		let res = self
 			.auth(
 				self.http_client
@@ -518,78 +539,39 @@ impl Provider for CommandCodeProvider {
 			u.latency_ms = Some(started.elapsed().as_millis() as u64);
 			u.request_id = request_id.or_else(|| v.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()));
 		}
-		Ok(ChatOutput { text, thinking, usage })
+		Ok(Completion {
+			text,
+			thinking,
+			tool_calls: Vec::new(),
+			usage,
+		})
 	}
+}
 
-	// -- POST /messages (Anthropic Messages, Claude系, 非ストリーム) ---------
-	async fn messages(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<String> {
-		Ok(self
-			.messages_with_usage(model, messages, system, max_tokens)
-			.await?
-			.text)
+/// Responses の本文。会話は `input` のメッセージ配列で送る。ツールとツールの往復は送れない。
+fn build_responses_body(model: &str, req: &ChatRequest) -> Result<serde_json::Value> {
+	if !req.tools.is_empty()
+		|| req
+			.messages
+			.iter()
+			.any(|m| m.role == "tool" || !m.tool_calls.is_empty())
+	{
+		return Err(Error::Unsupported("responses wire ではツールを使えません".into()));
 	}
-
-	async fn messages_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<ChatOutput> {
-		let started = std::time::Instant::now();
-		// Anthropic形: systemはトップレベル、messagesは user/assistant のみ
-		let mut body = serde_json::json!({
-			"model": model,
-			"max_tokens": max_tokens,
-			"messages": messages.iter().map(|m| serde_json::json!({
-				"role": if m.role == "system" { "user" } else { &m.role },
-				"content": m.content,
-			})).collect::<Vec<_>>(),
-		});
-		if let Some(s) = system {
-			body["system"] = serde_json::json!(s);
-		}
-		let res = self
-			.auth(
-				self.http_client
-					.post(format!("{}/messages", self.base_url))
-					.header("anthropic-version", "2023-06-01")
-					.json(&body),
-			)
-			.send()
-			.await
-			.map_err(transport)?;
-		let request_id = header_request_id(&res);
-		let res = self.check_error(res).await?;
-		let v: serde_json::Value = res.json().await.map_err(transport)?;
-		// {"content":[{"type":"text","text":"..."},{"type":"thinking","thinking":"..."}]}
-		// thinking系ブロックの `thinking` は本文に混ぜない。
-		let text = v
-			.get("content")
-			.and_then(|c| c.as_array())
-			.map(|arr| {
-				arr.iter()
-					.filter(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking"))
-					.filter(|b| b.get("type").and_then(|t| t.as_str()) != Some("redacted_thinking"))
-					.filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-					.collect::<Vec<_>>()
-					.join("")
-			})
-			.unwrap_or_default();
-		let thinking = extract_messages_thinking(&v);
-		let mut usage = v.get("usage").and_then(Usage::from_value);
-		if let Some(u) = usage.as_mut() {
-			u.latency_ms = Some(started.elapsed().as_millis() as u64);
-			u.request_id = request_id.or_else(|| v.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()));
-		}
-		Ok(ChatOutput { text, thinking, usage })
+	let input: Vec<serde_json::Value> = req
+		.messages
+		.iter()
+		.map(|m: &ChatMessage| serde_json::json!({"role": m.role, "content": m.content}))
+		.collect();
+	let mut body = serde_json::json!({
+		"model": model,
+		"input": input,
+		"stream": false,
+	});
+	if let Some(n) = req.max_tokens {
+		body["max_output_tokens"] = serde_json::json!(n);
 	}
+	Ok(body)
 }
 
 fn header_request_id(res: &reqwest::Response) -> Option<String> {
@@ -933,6 +915,43 @@ fn hint_for_status(status: u16, message: String) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn wires_are_picked_per_model() {
+		let eps = |e: &[&str]| e.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+		assert_eq!(Wire::for_model("claude-x", None), Wire::Messages);
+		assert_eq!(Wire::for_model("gpt", None), Wire::Chat);
+		assert_eq!(
+			Wire::for_model("gpt", Some(&eps(&["/v1/chat/completions", "/v1/responses"]))),
+			Wire::Chat
+		);
+		assert_eq!(
+			Wire::for_model("codex", Some(&eps(&["/v1/responses"]))),
+			Wire::Responses
+		);
+		assert_eq!(Wire::parse("auto").unwrap(), None);
+		assert_eq!(Wire::parse("messages").unwrap(), Some(Wire::Messages));
+		assert!(Wire::parse("nope").is_err());
+	}
+
+	#[test]
+	fn responses_body_sends_the_conversation() {
+		let req = ChatRequest {
+			max_tokens: Some(7),
+			..ChatRequest::new(vec![ChatMessage::system("s"), ChatMessage::user("hi")])
+		};
+		let body = build_responses_body("m", &req).unwrap();
+		assert_eq!(
+			body["input"],
+			serde_json::json!([{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}])
+		);
+		assert_eq!(body["max_output_tokens"], 7);
+		let with_tool = ChatRequest::new(vec![ChatMessage::tool_result("c1", "x")]);
+		assert!(matches!(
+			build_responses_body("m", &with_tool),
+			Err(Error::Unsupported(_))
+		));
+	}
 
 	#[test]
 	fn alpha_base_strips_provider_suffix() {

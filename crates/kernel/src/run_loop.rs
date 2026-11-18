@@ -1,8 +1,8 @@
 //! ループ本体。
 
 use crate::{
-	ChatMessage, DEFAULT_MAX_STEPS, Error, HookRegistry, ModelRequest, Provider, Result, RunHandler, ToolCall,
-	ToolDecision, ToolOutput, ToolRegistry, Usage,
+	ChatMessage, ChatRequest, DEFAULT_MAX_STEPS, Error, HookRegistry, ModelRequest, Provider, Result, RunHandler,
+	ToolCall, ToolDecision, ToolOutput, ToolRegistry, Usage, collect,
 };
 
 /// ループの依頼。
@@ -11,6 +11,8 @@ pub struct LoopRequest {
 	pub model: String,
 	pub messages: Vec<ChatMessage>,
 	pub max_tokens: Option<u32>,
+	/// Provider 固有の指定 ([`ChatRequest::extra`])。毎ステップに付く。
+	pub extra: serde_json::Value,
 	/// モデルを呼ぶ回数の上限 (暴走防止)。
 	pub max_steps: usize,
 }
@@ -21,6 +23,7 @@ impl LoopRequest {
 			model: model.into(),
 			messages,
 			max_tokens: None,
+			extra: serde_json::Value::Null,
 			max_steps: DEFAULT_MAX_STEPS,
 		}
 	}
@@ -56,6 +59,7 @@ pub async fn run_loop(
 		model,
 		mut messages,
 		max_tokens,
+		extra,
 		max_steps,
 	} = req;
 	if max_steps == 0 {
@@ -65,17 +69,17 @@ pub async fn run_loop(
 	let mut usage: Option<Usage> = None;
 
 	for step in 1..=max_steps {
-		let request = hooks
-			.before_request(ModelRequest {
-				model: model.clone(),
-				messages: messages.clone(),
-				tools: specs.clone(),
-				max_tokens,
-			})
-			.await?;
-		let turn = provider
-			.chat_with_tools(&request.model, request.messages, &request.tools, request.max_tokens)
-			.await?;
+		let request = ChatRequest {
+			messages: messages.clone(),
+			tools: specs.clone(),
+			max_tokens,
+			extra: extra.clone(),
+		};
+		let (model, request) = hooks
+			.before_request(ModelRequest::new(&model, request))
+			.await?
+			.into_parts();
+		let turn = collect(provider.chat(&model, request), &mut |_| {}, &mut |_| {}).await?;
 		let mut turn = hooks.after_response(turn).await?;
 		if let Some(u) = turn.usage.take() {
 			merge_usage(&mut usage, u);
@@ -234,33 +238,11 @@ mod tests {
 		async fn list_models(&self) -> Result<Vec<ModelInfo>> {
 			Ok(vec![])
 		}
-		async fn chat(&self, _: &str, _: Vec<ChatMessage>, _: Option<u32>) -> Result<String> {
-			unimplemented!()
-		}
-		async fn chat_stream(
-			&self,
-			_: &str,
-			_: Vec<ChatMessage>,
-			_: &mut (dyn for<'a> FnMut(&'a str) + Send),
-			_: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		) -> Result<String> {
-			unimplemented!()
-		}
-		async fn responses(&self, _: &str, _: &str) -> Result<String> {
-			unimplemented!()
-		}
-		async fn messages(&self, _: &str, _: Vec<ChatMessage>, _: Option<&str>, _: u32) -> Result<String> {
-			unimplemented!()
-		}
-		async fn chat_with_tools(
-			&self,
-			_: &str,
-			messages: Vec<ChatMessage>,
-			_: &[ToolSpec],
-			_: Option<u32>,
-		) -> Result<Completion> {
-			self.seen.lock().unwrap().push(messages);
-			Ok(self.turns.lock().unwrap().pop_front().expect("台本が尽きた"))
+		fn chat<'a>(&'a self, _: &'a str, req: crate::ChatRequest) -> crate::ChatStream<'a> {
+			crate::chat_stream(move |_| async move {
+				self.seen.lock().unwrap().push(req.messages);
+				Ok(self.turns.lock().unwrap().pop_front().expect("台本が尽きた"))
+			})
 		}
 	}
 

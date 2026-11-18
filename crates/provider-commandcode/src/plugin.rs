@@ -1,11 +1,12 @@
-//! kernel への登録。認証は環境変数 (`COMMAND_CODE_API_KEY` など) から読むので `cfg` は使わない。
+//! kernel への登録。認証は環境変数 (`COMMAND_CODE_API_KEY` など) から読む。
+//! `cfg.wire` (`auto` | `chat` | `responses` | `messages`) でリクエストに指定が無いときの wire を決め打ちできる。
 
 use std::sync::Arc;
 
 use letsharness_kernel::{PluginServer, Provider, ProviderFactory, Result};
 use serde_json::Value;
 
-use crate::CommandCodeProvider;
+use crate::{CommandCodeProvider, Wire};
 
 pub fn server() -> PluginServer {
 	PluginServer::new().provider(CommandCodeFactory)
@@ -18,7 +19,11 @@ impl ProviderFactory for CommandCodeFactory {
 		"commandcode"
 	}
 
-	fn create(&self, _cfg: &Value) -> Result<Arc<dyn Provider>> {
-		Ok(Arc::new(CommandCodeProvider::from_env()?))
+	fn create(&self, cfg: &Value) -> Result<Arc<dyn Provider>> {
+		let wire = match cfg.get("wire").and_then(Value::as_str) {
+			Some(w) => Wire::parse(w)?,
+			None => None,
+		};
+		Ok(Arc::new(CommandCodeProvider::from_env()?.with_wire(wire)))
 	}
 }

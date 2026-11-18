@@ -9,7 +9,8 @@
 use serde::{Deserialize, Serialize};
 
 mod agent;
-mod dispatch;
+mod chat;
+mod config;
 mod external;
 mod handler;
 mod hook;
@@ -25,6 +26,8 @@ mod session_log;
 mod tool;
 
 pub use agent::{AgentBackend, AgentOutcome, AgentRequest};
+pub use chat::{ChatEvent, ChatRequest, ChatSink, ChatStream, chat_stream, collect};
+pub use config::{CONFIG_FILE, Config, ProviderConfig};
 pub use external::{Contributes, MANIFEST_FILE, Manifest};
 pub use handler::{DEFAULT_MAX_STEPS, RunHandler};
 pub use hook::{Hook, HookPoint, HookRegistry, ModelRequest, ToolDecision};
@@ -38,7 +41,7 @@ pub use run_loop::{LoopOutcome, LoopRequest, run_loop};
 pub use serve::{
 	AgentBackendFactory, BootHook, HookFactory, ObserverFactory, PluginServer, ProviderFactory, ToolFactory,
 };
-pub use session::{Route, Session};
+pub use session::Session;
 pub use session_log::{LOG_VERSION, SessionId, log_path};
 pub use tool::{Tool, ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
@@ -376,27 +379,11 @@ impl Quota {
 	}
 }
 
-/// テキスト + 思考過程 + 使用量のセット。既存の `String` 返しと両立させるための器。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatOutput {
-	pub text: String,
-	/// モデルの思考過程 (reasoning / extended thinking)。無ければ `None`。
-	#[serde(default)]
-	pub thinking: Option<String>,
-	pub usage: Option<Usage>,
-}
-
-impl ChatOutput {
-	/// 空の思考過程 (`Some("")` や空白のみ) を `None` に正規化する。
-	pub fn normalized_thinking(thinking: Option<String>) -> Option<String> {
-		thinking.filter(|t| !t.trim().is_empty())
-	}
-}
-
-/// ツール付きリクエスト1回分の結果。`tool_calls` が空なら最終回答。
+/// モデルの応答1回分。`tool_calls` が空なら最終回答。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Completion {
 	pub text: String,
+	/// モデルの思考過程 (reasoning / extended thinking)。無ければ `None`。
 	#[serde(default)]
 	pub thinking: Option<String>,
 	/// モデルが要求したツール呼び出し (順序保持)。
@@ -405,47 +392,34 @@ pub struct Completion {
 	pub usage: Option<Usage>,
 }
 
+impl Completion {
+	/// 空の思考過程 (`Some("")` や空白のみ) を `None` に正規化する。
+	pub fn normalized_thinking(thinking: Option<String>) -> Option<String> {
+		thinking.filter(|t| !t.trim().is_empty())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
 
 /// 差し替えポイント。すべてのLLM実装はこれを満たす.
 ///
-/// `async_trait` を使うことで `Arc<dyn Provider>` として
-/// 動的ディスパッチできる (mock / 本番の差し替え、テスト容易性)。
+/// モデルを呼ぶ口は [`chat`](Provider::chat) の1本だけで、どの wire (`chat/completions` / `messages` / ...) で
+/// 送るか、ストリームで受けるかは実装の中で決める。`async_trait` を使うので `Arc<dyn Provider>` として差し替えられる。
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
-	/// Returns the name of this provider (e.g. "openai", "anthropic", "mock").
+	/// Returns the name of this provider (e.g. "commandcode", "gemini", "mock").
 	fn name(&self) -> &'static str;
 
 	/// Returns the supported models for this provider. (e.g. "deepseek/deepseek-v4.1-flash", "claude-opus-5-5").
 	async fn list_models(&self) -> Result<Vec<ModelInfo>>;
 
-	/// Returns the recommended wire for a given model. (e.g. "chat/completions", "responses", "messages").
-	async fn chat(&self, model: &str, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<String>;
-
-	/// POST /chat/completions 相当 (ストリーム)。
-	/// `on_delta` に部分テキスト、`on_thinking` に思考過程の差分を逐次渡し、戻り値で全文を返す。
-	/// `&mut dyn FnMut` にすることで `dyn LlmClient` でも呼べる。
-	async fn chat_stream(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<String>;
-
-	/// POST /responses 相当 (非ストリーム)。
-	async fn responses(&self, model: &str, input: &str) -> Result<String>;
-
-	/// POST /messages 相当 (Anthropic Messages, 非ストリーム)。
-	async fn messages(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<String>;
+	/// `model` に `req` を送り、応答を差分の流れとして返す。最後は必ず [`ChatEvent::Done`] (または `Err`)。
+	///
+	/// `req.tools` が空でないのにツールを扱えない実装は `Err(Unsupported("tools"))` を流す。
+	/// 実装はふつう [`chat_stream`] で書く。
+	fn chat<'a>(&'a self, model: &'a str, req: ChatRequest) -> ChatStream<'a>;
 
 	/// アカウントの残高・制限枠。未対応プロバイダは `Err(Unsupported)`。
 	///
@@ -454,105 +428,6 @@ pub trait Provider: Send + Sync {
 	async fn quota(&self) -> Result<Quota> {
 		Err(Error::Unsupported("quota".into()))
 	}
-
-	/// `chat` + `Usage` + 思考過程。デフォルトは `chat()` のラップ (usage / thinkingなし)。
-	async fn chat_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		max_tokens: Option<u32>,
-	) -> Result<ChatOutput> {
-		Ok(ChatOutput {
-			text: self.chat(model, messages, max_tokens).await?,
-			thinking: None,
-			usage: None,
-		})
-	}
-
-	/// `chat_stream` + `Usage` + 思考過程。デフォルトは `chat_stream()` のラップ。
-	/// 思考差分は `on_thinking` にそのまま流し、全文は `thinking` にもまとめる。
-	async fn chat_stream_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
-		on_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send),
-	) -> Result<ChatOutput> {
-		let mut thinking_buf = String::new();
-		let text = {
-			let thinking_buf_ref = &mut thinking_buf;
-			let wrapped_thinking: &mut (dyn for<'a> FnMut(&'a str) + Send) = &mut |chunk: &str| {
-				thinking_buf_ref.push_str(chunk);
-				on_thinking(chunk);
-			};
-			self.chat_stream(model, messages, on_delta, wrapped_thinking).await?
-		};
-		Ok(ChatOutput {
-			text,
-			thinking: ChatOutput::normalized_thinking(Some(thinking_buf)),
-			usage: None,
-		})
-	}
-
-	/// ツール定義つきの1ターン (非ストリーム)。ツール実行ループは [`run_loop`] が回す。
-	///
-	/// `tools` が空なら通常の `chat_with_usage` と同じ。空でないのに未対応の
-	/// プロバイダは `Err(Unsupported("tools"))` を返す。wire の選択は実装側の事情。
-	async fn chat_with_tools(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		tools: &[ToolSpec],
-		max_tokens: Option<u32>,
-	) -> Result<Completion> {
-		if !tools.is_empty() {
-			return Err(Error::Unsupported("tools".into()));
-		}
-		let out = self.chat_with_usage(model, messages, max_tokens).await?;
-		Ok(Completion {
-			text: out.text,
-			thinking: out.thinking,
-			tool_calls: Vec::new(),
-			usage: out.usage,
-		})
-	}
-
-	/// `responses` + `Usage`。デフォルトは `responses()` のラップ。
-	async fn responses_with_usage(&self, model: &str, input: &str) -> Result<ChatOutput> {
-		Ok(ChatOutput {
-			text: self.responses(model, input).await?,
-			thinking: None,
-			usage: None,
-		})
-	}
-
-	/// `messages` + `Usage`。デフォルトは `messages()` のラップ。
-	async fn messages_with_usage(
-		&self,
-		model: &str,
-		messages: Vec<ChatMessage>,
-		system: Option<&str>,
-		max_tokens: u32,
-	) -> Result<ChatOutput> {
-		Ok(ChatOutput {
-			text: self.messages(model, messages, system, max_tokens).await?,
-			thinking: None,
-			usage: None,
-		})
-	}
-}
-
-/// モデルIDから推奨wireを返す (カタログ無し時のフォールバック)。
-pub fn route_for_model(model_id: &str, supported: Option<&[String]>) -> &'static str {
-	if model_id.starts_with("claude-") {
-		return "messages";
-	}
-	if let Some(eps) = supported
-		&& eps.iter().any(|e| e.contains("/responses"))
-	{
-		return "responses";
-	}
-	"chat/completions"
 }
 
 #[cfg(test)]

@@ -19,10 +19,9 @@ use iced::widget::{
 use iced::{Center, Element, Fill, Length, Size, window};
 use iced_squircle::squircle;
 
-use letsharness_kernel::{BootConfig, ChatMessage, ChatOutput, Host, Kernel, Route, Session};
+use letsharness_kernel::{BootConfig, ChatMessage, ChatRequest, Completion, Host, Kernel, Session};
 
 /// `messages` wire (Anthropic) で使う出力上限。
-const MAX_TOKENS: u32 = 4096;
 /// 会話欄の最大幅。
 const COLUMN_WIDTH: f32 = 720.0;
 /// OS のタイトルバーの代わりに空けておく高さ。macOS では信号機ボタンがここに重なり、ドラッグで窓を動かせる。
@@ -178,7 +177,7 @@ enum Message {
 	Send,
 	Stop,
 	Delta(u64, Delta),
-	Finished(u64, Result<ChatOutput, String>),
+	Finished(u64, Result<Completion, String>),
 	NewChat,
 	SelectChat(usize),
 	ToggleThinking(usize),
@@ -223,13 +222,15 @@ impl App {
 	fn update(&mut self, message: Message) -> Task<Message> {
 		match message {
 			Message::Booted(Ok(host)) => {
-				self.providers = host.provider_kinds().into_iter().map(str::to_owned).collect();
-				self.kernel = Boot::Ready(host);
-				let default = ["commandcode", "mock"]
+				self.providers = host.provider_names();
+				let default = host
+					.default_provider()
 					.into_iter()
+					.chain(["commandcode", "mock"])
 					.find(|k| self.providers.iter().any(|p| p == k))
 					.map(str::to_owned)
 					.or_else(|| self.providers.first().cloned());
+				self.kernel = Boot::Ready(host);
 				if let Some(kind) = default {
 					return self.select_provider(kind);
 				}
@@ -362,7 +363,7 @@ impl App {
 		conversation.entries.push(Entry::new(Role::Assistant, String::new()));
 		// 初めての会話や、プロバイダを切り替えた会話は、ここまでの履歴を引き継いだ新しい Session で続ける。
 		let session = match self.sessions.get(&self.current) {
-			Some(s) if s.provider_kind() == client.provider_kind() => s.clone(),
+			Some(s) if s.provider() == client.provider() => s.clone(),
 			_ => {
 				let s = Arc::new(client.fork(earlier));
 				self.sessions.insert(self.current, s.clone());
@@ -624,15 +625,10 @@ fn options_cfg(options: &[(String, String)]) -> serde_json::Value {
 
 /// 1ターン分の応答。差分は [`Message::Delta`]、最後に全文を [`Message::Finished`] で返す。
 ///
-/// `claude-*` は CLI と同じく `messages` wire (非ストリーム)、それ以外は `chat/completions` のストリーム。
+/// wire (ストリームで届くかどうか) はプロバイダが選ぶ。
 fn respond(session: Arc<Session>, model: String, input: ChatMessage, id: u64) -> Task<Message> {
 	let (tx, rx) = mpsc::unbounded();
 	let work = async move {
-		let (route, max_tokens) = if model.starts_with("claude-") {
-			(Route::Messages, Some(MAX_TOKENS))
-		} else {
-			(Route::Stream, None)
-		};
 		let thinking_tx = tx.clone();
 		let mut on_delta = move |d: &str| {
 			let _ = tx.unbounded_send(Delta::Text(d.to_owned()));
@@ -640,9 +636,8 @@ fn respond(session: Arc<Session>, model: String, input: ChatMessage, id: u64) ->
 		let mut on_thinking = move |t: &str| {
 			let _ = thinking_tx.unbounded_send(Delta::Thinking(t.to_owned()));
 		};
-		session
-			.chat(route, &model, vec![input], max_tokens, &mut on_delta, &mut on_thinking)
-			.await
+		let stream = session.chat(&model, ChatRequest::new(vec![input]));
+		letsharness_kernel::collect(stream, &mut on_delta, &mut on_thinking).await
 	};
 	Task::batch([
 		Task::run(rx, move |d| Message::Delta(id, d)),
