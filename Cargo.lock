@@ -1511,6 +1511,7 @@ dependencies = [
 [[package]]
 name = "iced-squircle"
 version = "0.1.0"
+source = "git+https://github.com/potistudio/iced-squircle#c16ffff684bf4fef74e54bd79b67a1fb0452d589"
 dependencies = [
  "iced",
 ]
